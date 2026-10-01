@@ -1,17 +1,328 @@
-// ── AGENT-OWNED: tRPC API surface ────────────────────────────────────────────
-// Compose the app's procedures here. Keep them thin: validate input with zod,
-// call server/db.ts for data and server/services/* for external integrations.
-// Auth is provided by _core — do NOT reimplement sessions. Access levels:
-// publicProcedure (anyone) / protectedProcedure (ctx.user set) / adminProcedure.
+// ── AGENT-OWNED: tRPC API surface ───────────────────────────────────────────
+// Thin procedures only: validate with zod, delegate to server/db.ts for data,
+// server/services/* for external work and shared/game-rules.ts for the reward
+// maths. The client never sends an amount it computed — every reward is derived
+// server-side from the player's own stored state.
 import { z } from "zod";
 import { TRPCError } from "@trpc/server";
-import { router, publicProcedure, protectedProcedure } from "./_core/trpc";
+import { getCookie, setCookie, deleteCookie } from "hono/cookie";
+import * as bcrypt from "bcryptjs";
+import { router, publicProcedure, protectedProcedure, middleware } from "./_core/trpc";
 import { authProvider, registerLocalUser, AuthError, EmailTakenError } from "./_core/auth";
-import { storageCommit, storageDeleteOwned, storageListByOwner, storagePutUrl, StorageError } from "./_core/storage";
 import * as q from "./db";
+import { seedCatalogue } from "./services/seed";
+import { filesRouter } from "./demo-routers";
 
-// Auth: login/logout are provider-agnostic (go through the AuthProvider).
-// signup is LOCAL-only (SSO signup happens at the IdP) — guard if you switch.
+// Re-exported so `server/routers.test.ts` keeps exercising the real sanitiser.
+export { sanitizeBasename } from "./demo-routers";
+
+import {
+  assertTonTreasury,
+  commentPayload,
+  isTonAddress,
+  nanoTonToTonString,
+  verifyTonProof,
+} from "./services/ton";
+import {
+  NANO,
+  resolveConfig,
+  dayKey,
+  leagueFor,
+  type GameConfig,
+} from "../shared/game-config";
+import {
+  boosterAvailable,
+  freshBoosterUsage,
+  ladderRung,
+  quoteWithdrawal,
+  referralRewardCoin,
+  regenEnergy,
+  rigCost,
+  rigPerHour,
+  settleRigs,
+  settleTapBatch,
+  totalRigPerHour,
+  turboActive,
+  usdtCentsToNanoTon,
+  type BoosterUsage,
+  type RigsOwned,
+} from "../shared/game-rules";
+
+const ADMIN_COOKIE = "tap_arena_admin";
+const DEFAULT_ADMIN_PASSWORD = "taparena";
+const VEST_LOCK_DAYS = 7;
+
+const SAMPLE_HANDLES = [
+  "NovaMiner", "LunaTap", "CryptoHawk", "ZenithKing", "PixelPirate", "AquaByte", "VoltRider",
+  "StarForge", "NebulaX", "IronPulse", "GhostCoin", "SolarFlare", "ByteBaron", "QuantumFox",
+  "TurboNaut", "EchoStorm", "NeonDrift", "OrbitKid", "PlasmaPug", "AlphaWolf",
+];
+const SAMPLE_AVATARS = ["⛏️", "💎", "🚀", "🔥", "⚡", "👑", "🎯", "🌙", "🦅", "🐺"];
+
+/**
+ * A descending spread of plausible weekly totals. These are sized against the
+ * real economy — 1,000 energy regenerating at 1/3s is roughly 28,800 taps a
+ * day, so a regular player lands in the low tens of thousands per week. Scores
+ * in the millions would make the board read as fake beside a real score.
+ */
+const SAMPLE_WEEK_CURVE = [
+  47_500, 41_200, 36_800, 31_400, 27_900, 24_600, 21_300, 18_700, 16_400, 14_200,
+  12_600, 11_100, 9_800, 8_600, 7_500, 6_600, 5_800, 5_100, 4_400, 3_800,
+];
+
+let bootstrapPromise: Promise<{ catalogue: boolean; board: boolean }> | null = null;
+
+/**
+ * Idempotent first-run population of the catalogue and the sample leaderboard.
+ * Memoised for the process lifetime so a burst of first requests all await the
+ * same work rather than each racing to seed its own copy.
+ */
+async function ensureBootstrapped(cfg: GameConfig): Promise<{ catalogue: boolean; board: boolean }> {
+  if (bootstrapPromise) return bootstrapPromise;
+  bootstrapPromise = (async () => {
+    let catalogue = false;
+    let board = false;
+
+    // Both halves are checked independently — see countOffers() in db.ts.
+    if ((await q.countShopItems()) === 0 || (await q.countOffers()) === 0) {
+      await seedCatalogue();
+      catalogue = true;
+    }
+
+    if ((await q.countLeaderboardSeed()) === 0) {
+      const rows = SAMPLE_HANDLES.map((handle, i) => {
+        const coins = SAMPLE_WEEK_CURVE[i] ?? Math.max(2_000, Math.round(120_000 / (i + 1) ** 0.55));
+        let leagueIndex = 0;
+        cfg.leagueThresholds.forEach((t, li) => {
+          if (coins >= t) leagueIndex = li;
+        });
+        return {
+          handle,
+          avatar: SAMPLE_AVATARS[i % SAMPLE_AVATARS.length]!,
+          weekCoinMined: coins,
+          leagueIndex,
+        };
+      });
+      await q.seedLeaderboard(rows);
+      board = true;
+    }
+
+    return { catalogue, board };
+  })().catch((e) => {
+    // A failed seed must not be cached as "done", or the app would never retry.
+    bootstrapPromise = null;
+    throw e;
+  });
+
+  return bootstrapPromise;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Shared helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Read the profile, lazily settling energy regen, rig income and the week rollover. */
+async function syncProfile(userId: string, cfg: GameConfig) {
+  const before = await q.getProfile(userId);
+  if (!before) throw new TRPCError({ code: "NOT_FOUND", message: "No player profile." });
+
+  const now = new Date();
+  const patch: Record<string, unknown> = {};
+  let energy = before.energy;
+  let energyUpdatedAt = before.energyUpdatedAt;
+
+  // Energy regen
+  const regen = regenEnergy(cfg, before.energy, before.energyUpdatedAt, now);
+  if (regen.energy !== before.energy) {
+    energy = regen.energy;
+    energyUpdatedAt = regen.energyUpdatedAt;
+    patch.energy = energy;
+    patch.energyUpdatedAt = energyUpdatedAt;
+  }
+
+  // Passive rig income
+  const rigs = settleRigs(cfg, (before.rigsOwned ?? {}) as RigsOwned, before.rigAccruedAt, now);
+  if (rigs.coins > 0) {
+    patch.balanceCoin = before.balanceCoin + rigs.coins;
+    patch.totalCoinMined = before.totalCoinMined + rigs.coins;
+    patch.weekCoinMined = before.weekCoinMined + rigs.coins;
+    patch.rigAccruedAt = now;
+  } else if (now.getTime() - before.rigAccruedAt.getTime() > 60_000) {
+    patch.rigAccruedAt = now;
+  }
+
+  // Weekly leaderboard rollover
+  if (now.getTime() - before.weekStartAt.getTime() > 7 * 24 * 3600 * 1000) {
+    patch.weekCoinMined = 0;
+    patch.weekStartAt = now;
+  }
+
+  if (Object.keys(patch).length === 0) return before;
+
+  if (rigs.coins > 0) {
+    await q.addLedger({
+      userId,
+      kind: "rig_income",
+      deltaCoin: rigs.coins,
+      note: "Passive income from mining rigs",
+      refType: "rig",
+    });
+  }
+  await q.updateProfile(userId, patch as Partial<q.Profile>);
+  const after = await q.getProfile(userId);
+  return after ?? before;
+}
+
+/** Build the full client-facing game state. Never mutates. */
+function buildState(profile: q.Profile, cfg: GameConfig) {
+  const league = leagueFor(cfg, profile.totalCoinMined);
+  const usage = freshBoosterUsage(
+    cfg,
+    profile.boostersUsed as BoosterUsage,
+    profile.boosterDayKey,
+    dayKey(),
+  );
+  const turbosLeft = Math.max(0, cfg.turboFreePerDay - usage.usage.turbo);
+  const energyLeft = Math.max(0, cfg.energyRefillFreePerDay - usage.usage.energy);
+  const rechargeLeft = Math.max(0, cfg.rechargeFreePerDay - usage.usage.recharge);
+
+  const withdraw = quoteWithdrawal(cfg, profile.balanceNanoTon);
+
+  return {
+    serverNow: new Date().toISOString(),
+    profile: {
+      userId: profile.userId,
+      handle: profile.handle,
+      avatar: profile.avatar,
+      balanceCoin: profile.balanceCoin,
+      balanceNanoTon: profile.balanceNanoTon,
+      vestedNanoTon: profile.vestedNanoTon,
+      lockedNanoTon: profile.lockedNanoTon,
+      totalTaps: profile.totalTaps,
+      totalCoinMined: profile.totalCoinMined,
+      weekCoinMined: profile.weekCoinMined,
+      energy: profile.energy,
+      energyUpdatedAt: profile.energyUpdatedAt.toISOString(),
+      tapPowerLevel: profile.tapPowerLevel,
+      itemBoostPercent: profile.itemBoostPercent,
+      turboUntil: profile.turboUntil ? profile.turboUntil.toISOString() : null,
+      streakDay: profile.streakDay,
+      streakClaimedToday: profile.streakClaimedDayKey === dayKey(),
+      referralCode: profile.referralCode,
+      referralPremium: profile.referralPremium,
+      equippedSkin: profile.equippedSkin,
+      equippedButton: profile.equippedButton,
+      soundEnabled: profile.soundEnabled,
+      isAdmin: profile.isAdmin,
+      walletAddress: profile.walletAddress,
+      walletProvider: profile.walletProvider,
+      proofVerified: !!profile.proofVerifiedAt,
+      walletConnectedAt: profile.walletConnectedAt
+        ? profile.walletConnectedAt.toISOString()
+        : null,
+      withdrawalPending: profile.withdrawalPending,
+      createdAt: profile.createdAt.toISOString(),
+    },
+    cfg,
+    league: {
+      index: league.index,
+      name: league.name,
+      emoji: league.emoji,
+      mult: league.mult,
+      next: league.next,
+      progressPercent: league.next
+        ? Math.min(
+            100,
+            Math.round(
+              ((profile.totalCoinMined - (cfg.leagueThresholds[league.index] ?? 0)) /
+                Math.max(1, league.next - (cfg.leagueThresholds[league.index] ?? 0))) *
+                100,
+            ),
+          )
+        : 100,
+    },
+    boosters: {
+      turbo: { freeLeft: turbosLeft, cost: cfg.turboCostCoin },
+      energy: { freeLeft: energyLeft, cost: cfg.energyRefillCostCoin },
+      recharge: {
+        freeLeft: rechargeLeft,
+        cost: cfg.rechargeCostCoin,
+        readyAt: profile.rechargeReadyAt ? profile.rechargeReadyAt.toISOString() : null,
+      },
+    },
+    rigs: cfg.rigs.map((r, i) => {
+      const key = ["scrap_rig", "steel_rig", "plasma_rig", "quantum_rig"][i]!;
+      return {
+        key,
+        name: r.name,
+        costCoin: r.costCoin,
+        perHour: r.perHour,
+        owned: Number((profile.rigsOwned as RigsOwned)?.[key] ?? 0),
+      };
+    }),
+    rigPerHour: totalRigPerHour(cfg, (profile.rigsOwned ?? {}) as RigsOwned),
+    streakRewards: cfg.streakRewards,
+    withdraw,
+    turboActive: turboActive(cfg, profile.turboUntil, new Date()),
+  };
+}
+
+async function requireState(ctx: { user: { id: string } }, cfg: GameConfig) {
+  const profile = await syncProfile(ctx.user.id, cfg);
+  return buildState(profile, cfg);
+}
+
+/** Server-side task rule evaluation — a client cannot fake any of these. */
+function evaluateRule(
+  rule: string,
+  ruleValue: number,
+  data: {
+    profile: q.Profile;
+    referralCount: number;
+    adCount: number;
+    purchaseCount: number;
+    withdrawalCount: number;
+    cfg: GameConfig;
+  },
+): { ok: boolean; reason: string } {
+  const { profile } = data;
+  switch (rule) {
+    case "wallet":
+      return profile.walletAddress && profile.proofVerifiedAt
+        ? { ok: true, reason: "" }
+        : { ok: false, reason: "Connect and verify a TON wallet first." };
+    case "purchase":
+      return data.purchaseCount > 0
+        ? { ok: true, reason: "" }
+        : { ok: false, reason: "Buy anything from the shop first." };
+    case "withdrawal":
+      return data.withdrawalCount > 0
+        ? { ok: true, reason: "" }
+        : { ok: false, reason: "Complete a withdrawal first." };
+    case "referrals":
+      return data.referralCount >= ruleValue
+        ? { ok: true, reason: "" }
+        : {
+            ok: false,
+            reason: `You have ${data.referralCount} of ${ruleValue} required referrals.`,
+          };
+    case "ad":
+      return data.adCount >= ruleValue
+        ? { ok: true, reason: "" }
+        : { ok: false, reason: `Watch ${ruleValue - data.adCount} more ad(s).` };
+    case "league":
+      return leagueFor(data.cfg, profile.totalCoinMined).index >= ruleValue
+        ? { ok: true, reason: "" }
+        : { ok: false, reason: "That league is not reached yet." };
+    case "manual":
+    default:
+      return { ok: true, reason: "" };
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Auth
+// ─────────────────────────────────────────────────────────────────────────────
 const authRouter = router({
   me: publicProcedure.query(({ ctx }) => ctx.user),
 
@@ -20,14 +331,11 @@ const authRouter = router({
     .mutation(async ({ ctx, input }) => {
       try {
         const user = await registerLocalUser(input.email, input.password, input.name);
-        await authProvider().login(ctx.c, input.email, input.password); // set session cookie
+        await authProvider().login(ctx.c, input.email, input.password);
         return user;
       } catch (e: unknown) {
-        // CONFLICT, not a 500: the request was well-formed, the address is just
-        // taken. registerLocalUser has already turned the driver's SQLSTATE
-        // 23505 into this type — never pattern-match a DB error message here,
-        // Drizzle hides it behind a "Failed query: <sql>" wrapper.
-        if (e instanceof EmailTakenError) throw new TRPCError({ code: "CONFLICT", message: e.message });
+        if (e instanceof EmailTakenError)
+          throw new TRPCError({ code: "CONFLICT", message: e.message });
         throw e;
       }
     }),
@@ -38,7 +346,8 @@ const authRouter = router({
       try {
         return await authProvider().login(ctx.c, input.email, input.password);
       } catch (e) {
-        if (e instanceof AuthError) throw new TRPCError({ code: "UNAUTHORIZED", message: e.message });
+        if (e instanceof AuthError)
+          throw new TRPCError({ code: "UNAUTHORIZED", message: e.message });
         throw e;
       }
     }),
@@ -49,121 +358,1431 @@ const authRouter = router({
   }),
 });
 
-// Example business router (items). Every procedure is owner-scoped via ctx.user.
-const itemsRouter = router({
-  list: protectedProcedure.query(({ ctx }) => q.listItemsByOwner(ctx.user.id)),
+// ─────────────────────────────────────────────────────────────────────────────
+// Game — state, tapping, boosters, rigs, streak, prefs
+// ─────────────────────────────────────────────────────────────────────────────
+const gameRouter = router({
+  /**
+   * First-run bootstrap. The catalogue and the sample leaderboard rows are
+   * inserted lazily on the first authenticated read, so a fresh database (a new
+   * dev sandbox, or prod after a Publish) is populated without a manual admin
+   * step. Both inserts are idempotent, and the promise is memoised so concurrent
+   * requests cannot race two seeds.
+   */
+  bootstrap: protectedProcedure.mutation(async ({ ctx }) => {
+    const cfg = await q.getConfig();
+    const seeded = await ensureBootstrapped(cfg);
+    return { ...seeded, state: await requireState(ctx, cfg) };
+  }),
 
-  create: protectedProcedure
-    .input(z.object({ title: z.string().min(1), notes: z.string().optional(), coverUrl: z.string().optional() }))
-    .mutation(({ ctx, input }) => q.createItem({ ownerId: ctx.user.id, ...input })),
+  state: protectedProcedure.query(async ({ ctx }) => {
+    const cfg = await q.getConfig();
+    if (cfg.maintenanceMode) {
+      throw new TRPCError({
+        code: "PRECONDITION_FAILED",
+        message: "The arena is in maintenance. Please check back shortly.",
+      });
+    }
+    // First sight of this user: create the profile (welcome bonus granted once).
+    await q.ensureProfile({
+      userId: ctx.user.id,
+      handle: ctx.user.name?.trim() || ctx.user.email.split("@")[0]!,
+      cfg,
+      isAdmin: ctx.user.role === "admin",
+    });
+    return requireState(ctx, cfg);
+  }),
 
-  remove: protectedProcedure
-    .input(z.object({ id: z.uuid() }))
-    .mutation(({ ctx, input }) => q.deleteItem(input.id, ctx.user.id)),
-});
-
-// Sanitize a caller-supplied filename down to a safe key BASENAME: take the
-// last path segment (so "/../shared/report.pdf" can't steer the rest of the
-// key), keep only [A-Za-z0-9._-], strip leading dots (so a survivor of "." or
-// ".." can't slip through as a bare segment), and fall back to a fixed constant
-// when nothing survives. Exported so it can be unit-tested directly.
-//
-// The stem and the extension are sanitized SEPARATELY, and that split is the
-// whole point. Sanitizing the basename as one string used to destroy the
-// extension of any file whose stem was entirely non-ASCII: the allowlist below
-// deleted every CJK character in "风景.png", leaving ".png", and the leading-dot
-// strip — there to kill "." / ".." / dotfiles — then ate the extension
-// separator, because by that point it was the only dot left. The object landed
-// in storage as "<uuid>-png". Splitting first means the leading-dot rule only
-// ever sees the stem, where a leading dot really is a dotfile prefix.
-export function sanitizeBasename(name: string): string {
-  // Split on "\\" too: it cannot steer a path segment (the key joins on "/"),
-  // but a Windows path would otherwise fold its directories into the stem.
-  const last = name.split(/[/\\]/).pop() ?? "";
-  // `> 0`, not `>= 0`: in ".gitignore" the dot is a dotfile prefix, not an
-  // extension separator, so the whole name is the stem.
-  const dot = last.lastIndexOf(".");
-  const rawStem = dot > 0 ? last.slice(0, dot) : last;
-  const rawExt = dot > 0 ? last.slice(dot + 1) : "";
-  const stem =
-    rawStem.replace(/[^A-Za-z0-9._-]/g, "").replace(/^\.+/, "") || "upload";
-  // No dots or separators in an extension, and capped — the key is
-  // `${uuid}-${basename}`, so a long tail buys nothing.
-  const ext = rawExt.replace(/[^A-Za-z0-9]/g, "").slice(0, 10);
-  return ext ? `${stem}.${ext}` : stem;
-}
-
-// Example file-upload router. The three-step protocol matters: the browser PUTs
-// straight to object storage, so the server only learns the upload succeeded when
-// the client calls `commit`. Skipping commit leaves an unindexed orphan object —
-// never a row pointing at nothing.
-//
-//   1. uploadUrl  → signed PUT URL + the key to commit later
-//   2. browser    → PUT the bytes to uploadUrl
-//   3. commit     → index it (size/type are read back from storage)
-const filesRouter = router({
-  uploadUrl: protectedProcedure
-    .input(z.object({ name: z.string().min(1), contentType: z.string().min(1) }))
+  tap: protectedProcedure
+    .input(z.object({ taps: z.number().int().min(1).max(200) }))
     .mutation(async ({ ctx, input }) => {
-      // The uuid prefix makes the key unguessable ONLY if the rest of the key
-      // isn't attacker-controlled — sanitizeBasename strips the client-supplied
-      // `name` down to a safe basename first, so it can't steer path segments
-      // (e.g. "/../report.pdf") into someone else's key.
-      const key = `${crypto.randomUUID()}-${sanitizeBasename(input.name)}`;
-      try {
-        const { uploadUrl, publicPath } = await storagePutUrl(key, input.contentType, {
-          ownerId: ctx.user.id,
+      const cfg = await q.getConfig();
+      let profile = await syncProfile(ctx.user.id, cfg);
+      const now = new Date();
+
+      const result = settleTapBatch(
+        cfg,
+        {
+          energy: profile.energy,
+          energyUpdatedAt: profile.energyUpdatedAt,
+          tapPowerLevel: profile.tapPowerLevel,
+          itemBoostPercent: profile.itemBoostPercent,
+          turboUntil: profile.turboUntil,
+          comboCount: profile.comboCount,
+          lastTapAt: profile.lastTapAt,
+          leagueCoinMined: profile.totalCoinMined,
+        },
+        input.taps,
+        now,
+      );
+
+      if (result.taps > 0) {
+        const merged = await q.updateProfileGuarded(ctx.user.id, profile.updatedAt, {
+          energy: result.energy,
+          energyUpdatedAt: result.energyUpdatedAt,
+          comboCount: result.comboCount,
+          lastTapAt: result.lastTapAt,
+          balanceCoin: profile.balanceCoin + result.coins,
+          totalCoinMined: profile.totalCoinMined + result.coins,
+          weekCoinMined: profile.weekCoinMined + result.coins,
+          totalTaps: profile.totalTaps + result.taps,
         });
-        return { key, uploadUrl, publicPath };
-      } catch (e) {
-        if (e instanceof StorageError && e.code === "failed") {
-          throw new TRPCError({
-            code: "BAD_REQUEST",
-            message:
-              "upload rejected by storage — check contentType is on the platform's whitelist " +
-              "(see AGENT.md: png/jpeg/gif/webp/avif, pdf, text/plain, csv, json, mpeg/wav audio, mp4/webm video)",
+        if (merged.length === 0) {
+          // Somebody else wrote first — reload and let the next tap settle.
+          profile = await syncProfile(ctx.user.id, cfg);
+        } else {
+          profile = merged[0]!;
+          await q.addTapLog({
+            userId: ctx.user.id,
+            taps: result.taps,
+            coinsEarned: result.coins,
+            multiplierBp: Math.round(result.comboMult * 10000),
           });
         }
-        throw e;
       }
+
+      const state = buildState(profile, cfg);
+      return {
+        ...state,
+        lastTap: {
+          taps: result.taps,
+          coins: result.coins,
+          perTap: result.perTap,
+          comboMult: result.comboMult,
+          turbo: result.turbo,
+          truncated: result.truncated,
+        },
+      };
     }),
 
-  commit: protectedProcedure
-    .input(z.object({ key: z.string().min(1), name: z.string().min(1) }))
+  booster: protectedProcedure
+    .input(z.object({ kind: z.enum(["turbo", "energy", "recharge"]) }))
     .mutation(async ({ ctx, input }) => {
-      try {
-        return await storageCommit(input.key, { ownerId: ctx.user.id, name: input.name });
-      } catch (e) {
-        if (e instanceof StorageError && e.code === "not_found") {
-          throw new TRPCError({ code: "NOT_FOUND", message: "upload not found — did the PUT succeed?" });
+      const cfg = await q.getConfig();
+      const profile = await syncProfile(ctx.user.id, cfg);
+      const today = dayKey();
+      const { usage } = freshBoosterUsage(
+        cfg,
+        profile.boostersUsed as BoosterUsage,
+        profile.boosterDayKey,
+        today,
+      );
+
+      const avail = boosterAvailable(cfg, usage, input.kind, profile.balanceCoin);
+
+      if (input.kind === "recharge" && profile.rechargeReadyAt) {
+        if (profile.rechargeReadyAt.getTime() > Date.now()) {
+          const mins = Math.ceil((profile.rechargeReadyAt.getTime() - Date.now()) / 60000);
+          throw new TRPCError({
+            code: "PRECONDITION_FAILED",
+            message: `Recharge is on cooldown for another ${mins} minute(s).`,
+          });
         }
-        if (e instanceof StorageError && e.code === "forbidden") {
-          throw new TRPCError({ code: "FORBIDDEN", message: "that key belongs to another user" });
-        }
-        throw e;
       }
+
+      if (!avail.allowed) {
+        throw new TRPCError({
+          code: "PRECONDITION_FAILED",
+          message: `Not enough coins — this booster now costs ${avail.cost.toLocaleString("en-US")} COIN.`,
+        });
+      }
+
+      const nextUsage: BoosterUsage = { ...usage, [input.kind]: (usage[input.kind] ?? 0) + 1 };
+      const patch: Partial<q.Profile> = {
+        boostersUsed: nextUsage,
+        boosterDayKey: today,
+      };
+
+      if (avail.cost > 0) patch.balanceCoin = profile.balanceCoin - avail.cost;
+
+      if (input.kind === "turbo") {
+        const base = turboActive(cfg, profile.turboUntil, new Date())
+          ? profile.turboUntil!.getTime()
+          : Date.now();
+        patch.turboUntil = new Date(base + cfg.turboDurationSec * 1000);
+      } else if (input.kind === "energy") {
+        patch.energy = cfg.energyCap;
+        patch.energyUpdatedAt = new Date();
+      } else {
+        patch.energy = Math.min(cfg.energyCap, profile.energy + cfg.rechargeAmount);
+        patch.energyUpdatedAt = new Date();
+        patch.rechargeReadyAt = new Date(Date.now() + cfg.rechargeCooldownSec * 1000);
+      }
+
+      await q.updateProfile(ctx.user.id, patch);
+      if (avail.cost > 0) {
+        await q.addLedger({
+          userId: ctx.user.id,
+          kind: `booster_${input.kind}`,
+          deltaCoin: -avail.cost,
+          note: `Booster: ${input.kind} (paid)`,
+          refType: "booster",
+        });
+      }
+      return requireState(ctx, cfg);
     }),
 
-  list: protectedProcedure.query(({ ctx }) => storageListByOwner(ctx.user.id)),
-
-  remove: protectedProcedure
+  buyRig: protectedProcedure
     .input(z.object({ key: z.string().min(1) }))
     .mutation(async ({ ctx, input }) => {
-      try {
-        return await storageDeleteOwned(ctx.user.id, input.key);
-      } catch (e) {
-        if (e instanceof StorageError && e.code === "forbidden") {
-          throw new TRPCError({ code: "BAD_REQUEST", message: "malformed key" });
-        }
-        throw e;
+      const cfg = await q.getConfig();
+      const profile = await syncProfile(ctx.user.id, cfg);
+      const cost = rigCost(cfg, input.key);
+      if (!cost) throw new TRPCError({ code: "BAD_REQUEST", message: "Unknown rig." });
+      if (profile.balanceCoin < cost) {
+        throw new TRPCError({
+          code: "PRECONDITION_FAILED",
+          message: `Not enough coins — this rig costs ${cost.toLocaleString("en-US")} COIN.`,
+        });
       }
+      const owned = { ...((profile.rigsOwned ?? {}) as RigsOwned) };
+      owned[input.key] = Number(owned[input.key] ?? 0) + 1;
+
+      await q.updateProfile(ctx.user.id, {
+        balanceCoin: profile.balanceCoin - cost,
+        rigsOwned: owned,
+      });
+      await q.addLedger({
+        userId: ctx.user.id,
+        kind: "rig_purchase",
+        deltaCoin: -cost,
+        note: `Mining rig purchased (+${rigPerHour(cfg, input.key)}/hour)`,
+        refType: "rig",
+        refId: input.key,
+      });
+      return requireState(ctx, cfg);
+    }),
+
+  upgradeTap: protectedProcedure.mutation(async ({ ctx }) => {
+    const cfg = await q.getConfig();
+    const profile = await syncProfile(ctx.user.id, cfg);
+    if (profile.tapPowerLevel >= cfg.tapPowerUpgradeMax) {
+      throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Tap power is already maxed." });
+    }
+    const cost = cfg.tapPowerUpgradeCost;
+    if (profile.balanceCoin < cost) {
+      throw new TRPCError({
+        code: "PRECONDITION_FAILED",
+        message: `Not enough coins — the upgrade costs ${cost.toLocaleString("en-US")} COIN.`,
+      });
+    }
+    await q.updateProfile(ctx.user.id, {
+      balanceCoin: profile.balanceCoin - cost,
+      tapPowerLevel: profile.tapPowerLevel + cfg.tapPowerUpgradeStep,
+    });
+    await q.addLedger({
+      userId: ctx.user.id,
+      kind: "tap_upgrade",
+      deltaCoin: -cost,
+      note: `Tap power upgraded to level ${profile.tapPowerLevel + cfg.tapPowerUpgradeStep}`,
+      refType: "upgrade",
+    });
+    return requireState(ctx, cfg);
+  }),
+
+  claimStreak: protectedProcedure.mutation(async ({ ctx }) => {
+    const cfg = await q.getConfig();
+    const profile = await syncProfile(ctx.user.id, cfg);
+    const today = dayKey();
+    if (profile.streakClaimedDayKey === today) {
+      throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Streak already claimed today." });
+    }
+    const yesterday = dayKey(new Date(Date.now() - 24 * 3600 * 1000));
+    const continuing = profile.streakClaimedDayKey === yesterday;
+    const day = continuing ? Math.min(cfg.streakRewards.length, profile.streakDay + 1) : 1;
+    const reward = cfg.streakRewards[day - 1] ?? 0;
+
+    await q.updateProfile(ctx.user.id, {
+      streakDay: day,
+      streakClaimedDayKey: today,
+      balanceCoin: profile.balanceCoin + reward,
+      totalCoinMined: profile.totalCoinMined + reward,
+      weekCoinMined: profile.weekCoinMined + reward,
+    });
+    await q.addLedger({
+      userId: ctx.user.id,
+      kind: "streak_claim",
+      deltaCoin: reward,
+      note: `Daily streak — day ${day}`,
+      refType: "streak",
+      refId: String(day),
+    });
+    return { ...(await requireState(ctx, cfg)), streakClaimed: { day, reward } };
+  }),
+
+  prefs: protectedProcedure
+    .input(
+      z.object({
+        soundEnabled: z.boolean().optional(),
+        equippedSkin: z.string().optional(),
+        equippedButton: z.string().optional(),
+      }),
+    )
+    .mutation(async ({ ctx, input }) => {
+      const cfg = await q.getConfig();
+      await syncProfile(ctx.user.id, cfg);
+      const owned = await q.ownedItemSlugs(ctx.user.id);
+      const patch: Partial<q.Profile> = {};
+
+      if (input.soundEnabled !== undefined) patch.soundEnabled = input.soundEnabled;
+
+      if (input.equippedSkin) {
+        if (!owned.includes(input.equippedSkin))
+          throw new TRPCError({ code: "FORBIDDEN", message: "You do not own that skin." });
+        patch.equippedSkin = input.equippedSkin;
+        const item = (await q.listShopItems()).find((i) => i.slug === input.equippedSkin);
+        patch.itemBoostPercent = item?.boostPercent ?? 0;
+      }
+      if (input.equippedButton) {
+        if (!owned.includes(input.equippedButton))
+          throw new TRPCError({ code: "FORBIDDEN", message: "You do not own that button." });
+        patch.equippedButton = input.equippedButton;
+      }
+
+      if (Object.keys(patch).length) await q.updateProfile(ctx.user.id, patch);
+      return requireState(ctx, cfg);
     }),
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Wallet — TON Connect 2.0 with a real ton_proof
+// ─────────────────────────────────────────────────────────────────────────────
+const walletRouter = router({
+  nonce: protectedProcedure.mutation(async ({ ctx }) => {
+    const nonce = crypto.randomUUID().replace(/-/g, "");
+    const host =
+      ctx.c.req.header("origin")?.replace(/^https?:\/\//, "") ??
+      ctx.c.req.header("host") ??
+      "localhost";
+    await q.createNonce(nonce, nonce, host);
+    return { nonce, payload: nonce, domain: host };
+  }),
+
+  verify: protectedProcedure
+    .input(
+      z.object({
+        address: z.string().min(1),
+        publicKey: z.string().optional(),
+        walletStateInit: z.string().optional(),
+        network: z.string().optional(),
+        provider: z.string().optional(),
+        proof: z.object({
+          timestamp: z.number(),
+          domain: z.object({ lengthBytes: z.number(), value: z.string() }),
+          payload: z.string(),
+          signature: z.string(),
+        }),
+      }),
+    )
+    .mutation(async ({ ctx, input }) => {
+      // The nonce must be one we issued, and it is burned on first use so a
+      // captured proof cannot be replayed.
+      const burned = await q.burnNonce(input.proof.payload);
+      if (!burned) {
+        throw new TRPCError({
+          code: "BAD_REQUEST",
+          message: "That sign-in nonce is unknown, already used or expired. Reconnect your wallet.",
+        });
+      }
+
+      const host =
+        ctx.c.req.header("origin")?.replace(/^https?:\/\//, "") ??
+        ctx.c.req.header("host") ??
+        "localhost";
+
+      const result = await verifyTonProof(
+        {
+          address: input.address,
+          publicKey: input.publicKey,
+          walletStateInit: input.walletStateInit,
+          network: input.network,
+          proof: input.proof,
+        },
+        { domain: host, payload: input.proof.payload },
+      );
+
+      if (!result.ok) {
+        throw new TRPCError({
+          code: "BAD_REQUEST",
+          message: `Wallet verification failed: ${result.reason}.`,
+        });
+      }
+
+      await q.updateProfile(ctx.user.id, {
+        walletAddress: result.address,
+        walletPublicKey: result.publicKey,
+        walletProvider: input.provider ?? "tonconnect",
+        proofVerifiedAt: new Date(),
+        walletConnectedAt: new Date(),
+      });
+
+      const cfg = await q.getConfig();
+      await q.addLedger({
+        userId: ctx.user.id,
+        kind: "wallet_connected",
+        note: `TON wallet verified: ${result.address}`,
+        refType: "wallet",
+        refId: result.address,
+      });
+      return requireState(ctx, cfg);
+    }),
+
+  disconnect: protectedProcedure.mutation(async ({ ctx }) => {
+    await q.updateProfile(ctx.user.id, {
+      walletAddress: null,
+      walletPublicKey: null,
+      walletProvider: null,
+      proofVerifiedAt: null,
+      walletConnectedAt: null,
+    });
+    const cfg = await q.getConfig();
+    return requireState(ctx, cfg);
+  }),
+
+  ledger: protectedProcedure
+    .input(z.object({ limit: z.number().int().min(1).max(100).default(40) }).optional())
+    .query(async ({ ctx, input }) => {
+      const rows = await q.listLedger(ctx.user.id, input?.limit ?? 40);
+      return rows.map((r) => ({
+        id: r.id,
+        kind: r.kind,
+        deltaCoin: Number(r.deltaCoin),
+        deltaNanoTon: Number(r.deltaNanoTon),
+        note: r.note,
+        createdAt: r.createdAt.toISOString(),
+      }));
+    }),
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Shop — $0.50 × 2^tier, paid in TON (real on-chain) / Stars / COIN
+// ─────────────────────────────────────────────────────────────────────────────
+const shopRouter = router({
+  list: protectedProcedure.query(async ({ ctx }) => {
+    const cfg = await q.getConfig();
+    const items = await q.listShopItems();
+    const owned = new Set(await q.ownedItemSlugs(ctx.user.id));
+    const profile = await q.getProfile(ctx.user.id);
+    return {
+      items: items.map((i) => ({
+        slug: i.slug,
+        name: i.name,
+        description: i.description,
+        category: i.category,
+        tierIndex: i.tierIndex,
+        tier: i.tier,
+        priceUsdtCents: i.priceUsdtCents,
+        priceTon: nanoTonToTonString(usdtCentsToNanoTon(cfg, i.priceUsdtCents)),
+        coinPrice: Number(i.coinPrice),
+        boostPercent: i.boostPercent,
+        imageUrl: i.imageUrl,
+        owned: owned.has(i.slug),
+        equipped:
+          profile?.equippedSkin === i.slug || profile?.equippedButton === i.slug,
+      })),
+      railArmed: !!cfg.treasureTonAddress && isTonAddress(cfg.treasureTonAddress),
+      treasuryEvm: cfg.treasureEvmAddress,
+      treasuryTon: cfg.treasureTonAddress || null,
+      balanceCoin: profile?.balanceCoin ?? 0,
+      tonUsdRate: cfg.tonUsdRate,
+      usdtTonRate: cfg.usdtTonRate,
+    };
+  }),
+
+  /**
+   * Step 1 of a purchase. Creates the order and, for the TON rail, returns the
+   * transfer the wallet must sign. Nothing is delivered until `confirm`.
+   */
+  purchase: protectedProcedure
+    .input(z.object({ slug: z.string().min(1), rail: z.enum(["TON", "STARS", "COIN"]) }))
+    .mutation(async ({ ctx, input }) => {
+      const cfg = await q.getConfig();
+      const item = (await q.listShopItems()).find((i) => i.slug === input.slug);
+      if (!item) throw new TRPCError({ code: "NOT_FOUND", message: "That item is no longer sold." });
+
+      const owned = await q.ownedItemSlugs(ctx.user.id);
+      if (owned.includes(item.slug)) {
+        throw new TRPCError({ code: "CONFLICT", message: "You already own that item." });
+      }
+
+      const nanoTon = usdtCentsToNanoTon(cfg, item.priceUsdtCents);
+
+      // ── COIN rail: settles instantly, off-chain ──
+      if (input.rail === "COIN") {
+        const profile = await syncProfile(ctx.user.id, cfg);
+        const coinPrice = Number(item.coinPrice);
+        if (profile.balanceCoin < coinPrice) {
+          throw new TRPCError({
+            code: "PRECONDITION_FAILED",
+            message: `Not enough coins — this item costs ${coinPrice.toLocaleString("en-US")} COIN.`,
+          });
+        }
+        await q.createPurchase({
+          userId: ctx.user.id,
+          itemSlug: item.slug,
+          itemName: item.name,
+          category: item.category,
+          tier: item.tier,
+          priceUsdtCents: item.priceUsdtCents,
+          payCurrency: "COIN",
+          amountNanoTon: 0,
+          status: "paid",
+          detail: `Paid ${coinPrice} COIN`,
+        });
+        await q.updateProfile(ctx.user.id, { balanceCoin: profile.balanceCoin - coinPrice });
+        await q.addLedger({
+          userId: ctx.user.id,
+          kind: "purchase",
+          deltaCoin: -coinPrice,
+          note: `Shop: ${item.name} (${item.tier}) paid in COIN`,
+          refType: "purchase",
+          refId: item.slug,
+        });
+        return { mode: "settled" as const, item: item.name, state: await requireState(ctx, cfg) };
+      }
+
+      // ── TON rail: build a REAL on-chain transfer to the treasury ──
+      if (input.rail === "TON") {
+        const profile = await syncProfile(ctx.user.id, cfg);
+        if (!profile.walletAddress) {
+          throw new TRPCError({
+            code: "PRECONDITION_FAILED",
+            message: "Connect your TON wallet before paying on-chain.",
+          });
+        }
+        let treasury: string;
+        try {
+          treasury = assertTonTreasury(cfg.treasureTonAddress, cfg.treasureEvmAddress);
+        } catch (e) {
+          // The rail is deliberately not armed — say so instead of faking a hash.
+          throw new TRPCError({
+            code: "PRECONDITION_FAILED",
+            message: (e as Error).message,
+          });
+        }
+        await q.createPurchase({
+          userId: ctx.user.id,
+          itemSlug: item.slug,
+          itemName: item.name,
+          category: item.category,
+          tier: item.tier,
+          priceUsdtCents: item.priceUsdtCents,
+          payCurrency: "TON",
+          amountNanoTon: nanoTon,
+          status: "pending",
+          detail: `Awaiting on-chain payment to ${treasury}`,
+        });
+        return {
+          mode: "onchain" as const,
+          item: item.name,
+          amountNanoTon: nanoTon,
+          amountTon: nanoTonToTonString(nanoTon),
+          treasury,
+          comment: `TON Tap Arena — ${item.name}`,
+          commentPayload: commentPayload(`TON Tap Arena — ${item.name}`),
+          state: await requireState(ctx, cfg),
+        };
+      }
+
+      // ── Stars rail: platform-compliant digital-goods path ──
+      await q.createPurchase({
+        userId: ctx.user.id,
+        itemSlug: item.slug,
+        itemName: item.name,
+        category: item.category,
+        tier: item.tier,
+        priceUsdtCents: item.priceUsdtCents,
+        payCurrency: "STARS",
+        amountNanoTon: 0,
+        status: "pending",
+        detail: "Awaiting Telegram Stars invoice",
+      });
+      return {
+        mode: "stars" as const,
+        item: item.name,
+        amountStars: Math.max(1, Math.round(item.priceUsdtCents / 2)),
+        state: await requireState(ctx, cfg),
+      };
+    }),
+
+  /** Step 2: the wallet returned a tx hash — mark the order paid and deliver. */
+  confirm: protectedProcedure
+    .input(z.object({ slug: z.string().min(1), txHash: z.string().min(1).max(200) }))
+    .mutation(async ({ ctx, input }) => {
+      const cfg = await q.getConfig();
+      await q.markPurchase(ctx.user.id, input.slug, {
+        status: "paid",
+        txHash: input.txHash,
+        detail: "Paid on-chain",
+      });
+      await q.addLedger({
+        userId: ctx.user.id,
+        kind: "purchase",
+        note: `Shop: ${input.slug} paid on-chain (${input.txHash.slice(0, 12)}…)`,
+        refType: "purchase",
+        refId: input.slug,
+      });
+      return requireState(ctx, cfg);
+    }),
+
+  mine: protectedProcedure.query(async ({ ctx }) => {
+    const rows = await q.listPurchases(ctx.user.id);
+    return rows.map((r) => ({
+      id: r.id,
+      itemSlug: r.itemSlug,
+      itemName: r.itemName,
+      tier: r.tier,
+      category: r.category,
+      priceUsdtCents: r.priceUsdtCents,
+      payCurrency: r.payCurrency,
+      status: r.status,
+      txHash: r.txHash,
+      createdAt: r.createdAt.toISOString(),
+    }));
+  }),
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Withdrawal — the 5 TON gate
+// ─────────────────────────────────────────────────────────────────────────────
+const withdrawalRouter = router({
+  info: protectedProcedure.query(async ({ ctx }) => {
+    const cfg = await q.getConfig();
+    const profile = await q.getProfile(ctx.user.id);
+    if (!profile) throw new TRPCError({ code: "NOT_FOUND", message: "No player profile." });
+
+    const since = new Date(Date.now() - 24 * 3600 * 1000);
+    const recent = await q.withdrawalsSince(ctx.user.id, since);
+    const usedToday = recent
+      .filter((w) => w.status !== "failed")
+      .reduce((s, w) => s + Number(w.amountNanoTon), 0);
+
+    const quote = quoteWithdrawal(cfg, profile.balanceNanoTon);
+    const railArmed = !!cfg.treasureTonAddress && isTonAddress(cfg.treasureTonAddress);
+
+    return {
+      ...quote,
+      thresholdTon: cfg.withdrawThresholdTon,
+      feePercent: cfg.withdrawFeePercent,
+      networkFeeTon: cfg.withdrawNetworkFeeTon,
+      vestedPercent: cfg.vestedPercent,
+      dailyLimitNanoTon: Math.round(cfg.withdrawDailyLimitTon * NANO),
+      usedTodayNanoTon: usedToday,
+      dailyLimitRemainingNanoTon: Math.max(
+        0,
+        Math.round(cfg.withdrawDailyLimitTon * NANO) - usedToday,
+      ),
+      walletConnected: !!profile.walletAddress,
+      proofVerified: !!profile.proofVerifiedAt,
+      walletAddress: profile.walletAddress,
+      withdrawalPending: profile.withdrawalPending,
+      railArmed,
+      treasuryEvm: cfg.treasureEvmAddress,
+      treasuryTon: cfg.treasureTonAddress || null,
+      /** The gate, spelled out — mirrors `canWithdraw` in the spec. */
+      canWithdraw:
+        quote.eligible &&
+        !profile.withdrawalPending &&
+        !!profile.walletAddress &&
+        railArmed &&
+        usedToday + quote.grossNanoTon <= Math.round(cfg.withdrawDailyLimitTon * NANO),
+    };
+  }),
+
+  request: protectedProcedure
+    .input(z.object({ address: z.string().min(1).optional() }))
+    .mutation(async ({ ctx, input }) => {
+      const cfg = await q.getConfig();
+      const profile = await syncProfile(ctx.user.id, cfg);
+
+      if (!profile.walletAddress || !profile.proofVerifiedAt) {
+        throw new TRPCError({
+          code: "PRECONDITION_FAILED",
+          message: "Connect and verify your TON wallet before withdrawing.",
+        });
+      }
+      if (profile.withdrawalPending) {
+        throw new TRPCError({
+          code: "PRECONDITION_FAILED",
+          message: "You already have a withdrawal in progress.",
+        });
+      }
+
+      const quote = quoteWithdrawal(cfg, profile.balanceNanoTon);
+      if (!quote.eligible) {
+        throw new TRPCError({
+          code: "PRECONDITION_FAILED",
+          message:
+            `You need ${cfg.withdrawThresholdTon} TON to withdraw — ` +
+            `you are ${nanoTonToTonString(quote.shortfallNanoTon)} TON short.`,
+        });
+      }
+
+      const since = new Date(Date.now() - 24 * 3600 * 1000);
+      const recent = await q.withdrawalsSince(ctx.user.id, since);
+      const usedToday = recent
+        .filter((w) => w.status !== "failed")
+        .reduce((s, w) => s + Number(w.amountNanoTon), 0);
+      const limitNano = Math.round(cfg.withdrawDailyLimitTon * NANO);
+      if (usedToday + quote.grossNanoTon > limitNano) {
+        throw new TRPCError({
+          code: "PRECONDITION_FAILED",
+          message: "That would exceed the daily withdrawal cap.",
+        });
+      }
+
+      const payoutAddress =
+        input.address && isTonAddress(input.address) ? input.address : profile.walletAddress;
+      const treasuryOk = !!cfg.treasureTonAddress && isTonAddress(cfg.treasureTonAddress);
+
+      const row = await q.insertWithdrawal({
+        userId: ctx.user.id,
+        amountNanoTon: quote.grossNanoTon,
+        feeNanoTon: quote.feeNanoTon,
+        networkFeeNanoTon: quote.networkFeeNanoTon,
+        netNanoTon: quote.netNanoTon,
+        vestedNanoTon: quote.vestedNanoTon,
+        payoutAddress,
+        status: "pending",
+        failReason: treasuryOk
+          ? null
+          : "Payout rail not armed: no TON treasury address is configured, so the transfer is queued, not broadcast.",
+      });
+
+      // Debit to locked so the balance cannot be spent twice while pending.
+      await q.updateProfile(ctx.user.id, {
+        balanceNanoTon: 0,
+        lockedNanoTon: profile.lockedNanoTon + quote.grossNanoTon,
+        vestedNanoTon: profile.vestedNanoTon + quote.vestedNanoTon,
+        withdrawalPending: true,
+      });
+
+      await q.addLedger({
+        userId: ctx.user.id,
+        kind: "withdrawal_requested",
+        deltaNanoTon: -quote.grossNanoTon,
+        note:
+          `Withdrawal requested — ${nanoTonToTonString(quote.grossNanoTon)} TON ` +
+          `(fee ${nanoTonToTonString(quote.feeNanoTon)}, net ${nanoTonToTonString(quote.netNanoTon)}, ` +
+          `${cfg.vestedPercent}% vested for ${VEST_LOCK_DAYS} days)`,
+        refType: "withdrawal",
+        refId: row?.id ?? null,
+      });
+
+      // The exact transfer the treasury will broadcast — built with the real
+      // address parser, so an invalid treasury is caught here, not on-chain.
+      let transfer: { to: string; amountTon: string; payloadBase64: string } | null = null;
+      if (treasuryOk) {
+        transfer = {
+          to: cfg.treasureTonAddress,
+          amountTon: nanoTonToTonString(quote.netNanoTon),
+          payloadBase64: commentPayload(`TON Tap Arena payout ${row?.id ?? ""}`.slice(0, 120)),
+        };
+      }
+
+      return {
+        ok: true,
+        withdrawalId: row?.id ?? null,
+        status: row?.status ?? "pending",
+        railArmed: treasuryOk,
+        transfer,
+        message: treasuryOk
+          ? "Withdrawal queued. The treasury signs and broadcasts the transfer."
+          : "Withdrawal queued on the off-chain ledger. The on-chain rail is not armed until a 32-byte TON treasury address is set in the admin panel.",
+        state: await requireState(ctx, cfg),
+      };
+    }),
+
+  list: protectedProcedure.query(async ({ ctx }) => {
+    const rows = await q.listWithdrawals(ctx.user.id);
+    return rows.map((r) => ({
+      id: r.id,
+      amountNanoTon: Number(r.amountNanoTon),
+      netNanoTon: Number(r.netNanoTon),
+      feeNanoTon: Number(r.feeNanoTon),
+      vestedNanoTon: Number(r.vestedNanoTon),
+      payoutAddress: r.payoutAddress,
+      status: r.status,
+      txHash: r.txHash,
+      failReason: r.failReason,
+      createdAt: r.createdAt.toISOString(),
+    }));
+  }),
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Referrals
+// ─────────────────────────────────────────────────────────────────────────────
+const referralRouter = router({
+  summary: protectedProcedure.query(async ({ ctx }) => {
+    const cfg = await q.getConfig();
+    const profile = await q.getProfile(ctx.user.id);
+    if (!profile) throw new TRPCError({ code: "NOT_FOUND", message: "No player profile." });
+    const rows = await q.listReferrals(ctx.user.id);
+    const active = rows.filter((r) => r.status === "active");
+    const rung = ladderRung(cfg, active.length);
+
+    return {
+      code: profile.referralCode,
+      link: `https://t.me/share/url?url=${encodeURIComponent(
+        `https://t.me/TonTapArenaBot/app?startapp=${profile.referralCode}`,
+      )}`,
+      appLink: `https://t.me/TonTapArenaBot/app?startapp=${profile.referralCode}`,
+      total: rows.length,
+      activeCount: active.length,
+      premiumCount: rows.filter((r) => r.status === "premium").length,
+      coinsEarned: rows.reduce((s, r) => s + Number(r.coinsAwarded), 0),
+      rewardPerInvite: referralRewardCoin(cfg, false),
+      rewardPerPremium: referralRewardCoin(cfg, true),
+      revenueSharePercent: cfg.referralRevenueSharePercent,
+      ladder: cfg.referralLadder.map((r) => ({
+        ...r,
+        reached: active.length >= r.friends,
+        progress: Math.min(100, Math.round((active.length / r.friends) * 100)),
+      })),
+      currentRung: rung,
+      referrals: rows.map((r) => ({
+        id: r.id,
+        handle: r.handle ?? "Player",
+        avatar: r.avatar ?? "⛏️",
+        coinsAwarded: Number(r.coinsAwarded),
+        status: r.status,
+        weekCoinMined: Number(r.weekCoinMined ?? 0),
+        createdAt: r.createdAt.toISOString(),
+      })),
+    };
+  }),
+
+  applyCode: protectedProcedure
+    .input(z.object({ code: z.string().min(1).max(32) }))
+    .mutation(async ({ ctx, input }) => {
+      const cfg = await q.getConfig();
+      const profile = await syncProfile(ctx.user.id, cfg);
+      if (profile.referredBy) {
+        throw new TRPCError({ code: "CONFLICT", message: "A referral code is already applied." });
+      }
+      const referrer = await q.findReferrerByCode(input.code.trim());
+      if (!referrer) {
+        throw new TRPCError({ code: "NOT_FOUND", message: "That referral code does not exist." });
+      }
+      if (referrer === ctx.user.id) {
+        throw new TRPCError({ code: "BAD_REQUEST", message: "You cannot refer yourself." });
+      }
+
+      await q.updateProfile(ctx.user.id, { referredBy: referrer });
+      const bonus = referralRewardCoin(cfg, profile.referralPremium);
+
+      const referrerProfile = await q.getProfile(referrer);
+      if (referrerProfile) {
+        await q.updateProfile(referrer, { balanceCoin: referrerProfile.balanceCoin + bonus });
+        await q.addLedger({
+          userId: referrer,
+          kind: "referral_bonus",
+          deltaCoin: bonus,
+          note: "New referral joined",
+          refType: "referral",
+          refId: ctx.user.id,
+        });
+      }
+      await q.addLedger({
+        userId: ctx.user.id,
+        kind: "referral_applied",
+        note: "Referral code applied",
+        refType: "referral",
+        refId: referrer,
+      });
+      return { ok: true, bonus, state: await requireState(ctx, cfg) };
+    }),
+
+  claimRung: protectedProcedure
+    .input(z.object({ name: z.string().min(1) }))
+    .mutation(async ({ ctx, input }) => {
+      const cfg = await q.getConfig();
+      const rows = await q.listReferrals(ctx.user.id);
+      const active = rows.filter((r) => r.status === "active").length;
+      const rung = cfg.referralLadder.find((r) => r.name === input.name);
+      if (!rung) throw new TRPCError({ code: "NOT_FOUND", message: "Unknown ladder rung." });
+      if (active < rung.friends) {
+        throw new TRPCError({
+          code: "PRECONDITION_FAILED",
+          message: `You need ${rung.friends} referrals — you have ${active}.`,
+        });
+      }
+      const claimSlug = `rung:${rung.name}`;
+      const fresh = await q.claimTask({ userId: ctx.user.id, offerSlug: claimSlug, rewardCoin: 0 });
+      if (!fresh) {
+        throw new TRPCError({ code: "CONFLICT", message: "That rung reward was already claimed." });
+      }
+      const nano = Math.round(rung.bonusTon * NANO);
+      const profile = await syncProfile(ctx.user.id, cfg);
+      await q.updateProfile(ctx.user.id, { balanceNanoTon: profile.balanceNanoTon + nano });
+      await q.addLedger({
+        userId: ctx.user.id,
+        kind: "referral_ladder",
+        deltaNanoTon: nano,
+        note: `Referral ladder — ${rung.name} (${rung.friends} friends)`,
+        refType: "referral",
+        refId: rung.name,
+      });
+      return { ok: true, bonusTon: rung.bonusTon, state: await requireState(ctx, cfg) };
+    }),
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Leaderboard
+// ─────────────────────────────────────────────────────────────────────────────
+const leaderboardRouter = router({
+  weekly: protectedProcedure.query(async ({ ctx }) => {
+    const cfg = await q.getConfig();
+    const board = await q.buildLeaderboard(cfg, ctx.user.id);
+    return {
+      ...board,
+      leagueNames: cfg.leagueNames,
+      leagueEmojis: cfg.leagueEmojis,
+      leagueMultipliers: cfg.leagueMultipliers,
+      weekStart: new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString(),
+    };
+  }),
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Offers & tasks
+// ─────────────────────────────────────────────────────────────────────────────
+const offersRouter = router({
+  list: protectedProcedure.query(async ({ ctx }) => {
+    const cfg = await q.getConfig();
+    const [rows, completed, profile, refRows] = await Promise.all([
+      q.listOffers(),
+      q.listTaskCompletions(ctx.user.id),
+      q.getProfile(ctx.user.id),
+      q.listReferrals(ctx.user.id),
+    ]);
+    const done = new Set(completed);
+    const adCount = await q.countAdViewsSince(ctx.user.id, new Date(Date.now() - 86_400_000));
+    const purchases = await q.listPurchases(ctx.user.id);
+    const withdrawals = await q.listWithdrawals(ctx.user.id);
+
+    return {
+      offers: rows.map((o) => {
+        const evalResult = profile
+          ? evaluateRule(o.rule, o.ruleValue, {
+              profile,
+              referralCount: refRows.filter((r) => r.status === "active").length,
+              adCount,
+              purchaseCount: purchases.filter((p) => p.status !== "failed").length,
+              withdrawalCount: withdrawals.length,
+              cfg,
+            })
+          : { ok: false, reason: "Sign in to claim." };
+        return {
+          slug: o.slug,
+          title: o.title,
+          description: o.description,
+          url: o.url,
+          icon: o.icon,
+          kind: o.kind,
+          rule: o.rule,
+          ruleValue: o.ruleValue,
+          rewardCoin: Number(o.rewardCoin),
+          bonusNanoTon: Number(o.bonusNanoTon),
+          ctaLabel: o.ctaLabel,
+          claimed: done.has(o.slug),
+          eligible: evalResult.ok,
+          hint: evalResult.reason,
+          requiresUrl: !!o.url,
+        };
+      }),
+      totalClaimable: rows
+        .filter((o) => !done.has(o.slug))
+        .reduce((s, o) => s + Number(o.rewardCoin), 0),
+      claimedCount: completed.length,
+      totalCount: rows.length,
+    };
+  }),
+
+  claim: protectedProcedure
+    .input(z.object({ slug: z.string().min(1), visited: z.boolean().optional() }))
+    .mutation(async ({ ctx, input }) => {
+      const cfg = await q.getConfig();
+      const offer = (await q.listOffers()).find((o) => o.slug === input.slug);
+      if (!offer) throw new TRPCError({ code: "NOT_FOUND", message: "That offer is not available." });
+
+      const profile = await q.getProfile(ctx.user.id);
+      if (!profile) throw new TRPCError({ code: "NOT_FOUND", message: "No player profile." });
+
+      // A manual (Telegram channel) task requires the client to confirm the link
+      // was actually opened. Everything else is checked against real state.
+      if (offer.rule === "manual" && offer.url && !input.visited) {
+        throw new TRPCError({
+          code: "PRECONDITION_FAILED",
+          message: "Open the link first, then come back to claim.",
+        });
+      }
+
+      const [refRows, adCount, purchases, withdrawals] = await Promise.all([
+        q.listReferrals(ctx.user.id),
+        q.countAdViewsSince(ctx.user.id, new Date(Date.now() - 86_400_000)),
+        q.listPurchases(ctx.user.id),
+        q.listWithdrawals(ctx.user.id),
+      ]);
+
+      const verdict = evaluateRule(offer.rule, offer.ruleValue, {
+        profile,
+        referralCount: refRows.filter((r) => r.status === "active").length,
+        adCount,
+        purchaseCount: purchases.filter((p) => p.status !== "failed").length,
+        withdrawalCount: withdrawals.length,
+        cfg,
+      });
+      if (!verdict.ok) {
+        throw new TRPCError({ code: "PRECONDITION_FAILED", message: verdict.reason });
+      }
+
+      const reward = Number(offer.rewardCoin);
+      const fresh = await q.claimTask({ userId: ctx.user.id, offerSlug: offer.slug, rewardCoin: reward });
+      if (!fresh) {
+        throw new TRPCError({ code: "CONFLICT", message: "You already claimed that reward." });
+      }
+
+      const bonusNano = Number(offer.bonusNanoTon);
+      const current = await q.getProfile(ctx.user.id);
+      await q.updateProfile(ctx.user.id, {
+        balanceCoin: (current?.balanceCoin ?? 0) + reward,
+        totalCoinMined: (current?.totalCoinMined ?? 0) + reward,
+        weekCoinMined: (current?.weekCoinMined ?? 0) + reward,
+        ...(bonusNano > 0
+          ? { balanceNanoTon: (current?.balanceNanoTon ?? 0) + bonusNano }
+          : {}),
+      });
+      await q.addLedger({
+        userId: ctx.user.id,
+        kind: "task_reward",
+        deltaCoin: reward,
+        deltaNanoTon: bonusNano,
+        note: `Task: ${offer.title}`,
+        refType: "offer",
+        refId: offer.slug,
+      });
+
+      return { ok: true, rewardCoin: reward, state: await requireState(ctx, cfg) };
+    }),
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Ads — placeholder slot, fully admin-configurable
+// ─────────────────────────────────────────────────────────────────────────────
+const adsRouter = router({
+  status: protectedProcedure.query(async ({ ctx }) => {
+    const cfg = await q.getConfig();
+    const since = new Date();
+    since.setUTCHours(0, 0, 0, 0);
+    const usedToday = await q.countAdViewsSince(ctx.user.id, since);
+    const allTime = await q.countAdViewsSince(ctx.user.id, new Date(0));
+    return {
+      enabled: cfg.adEnabled,
+      unitId: cfg.adUnitId,
+      link: cfg.adLink,
+      rewardCoin: cfg.adRewardCoin,
+      dailyLimit: cfg.adDailyLimit,
+      watchSeconds: cfg.adWatchSeconds,
+      usedToday,
+      remaining: Math.max(0, cfg.adDailyLimit - usedToday),
+      allTime,
+    };
+  }),
+
+  watch: protectedProcedure
+    .input(z.object({ watchedSeconds: z.number().min(0).max(3600) }))
+    .mutation(async ({ ctx, input }) => {
+      const cfg = await q.getConfig();
+      if (!cfg.adEnabled) {
+        throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Ads are currently disabled." });
+      }
+      // A zero-length impression can never earn the reward, whatever the client says.
+      if (input.watchedSeconds < cfg.adWatchSeconds) {
+        throw new TRPCError({
+          code: "PRECONDITION_FAILED",
+          message: `Watch the full ${cfg.adWatchSeconds}s to earn the reward.`,
+        });
+      }
+      const since = new Date();
+      since.setUTCHours(0, 0, 0, 0);
+      const usedToday = await q.countAdViewsSince(ctx.user.id, since);
+      if (usedToday >= cfg.adDailyLimit) {
+        throw new TRPCError({
+          code: "PRECONDITION_FAILED",
+          message: `That is all ${cfg.adDailyLimit} ad views for today. Come back tomorrow.`,
+        });
+      }
+
+      await q.addAdView({
+        userId: ctx.user.id,
+        rewardCoin: cfg.adRewardCoin,
+        adUnitId: cfg.adUnitId,
+      });
+
+      const profile = await syncProfile(ctx.user.id, cfg);
+      await q.updateProfile(ctx.user.id, {
+        balanceCoin: profile.balanceCoin + cfg.adRewardCoin,
+        totalCoinMined: profile.totalCoinMined + cfg.adRewardCoin,
+        weekCoinMined: profile.weekCoinMined + cfg.adRewardCoin,
+      });
+      await q.addLedger({
+        userId: ctx.user.id,
+        kind: "ad_reward",
+        deltaCoin: cfg.adRewardCoin,
+        note: `Ad view reward (unit ${cfg.adUnitId})`,
+        refType: "ad",
+      });
+
+      return {
+        ok: true,
+        rewardCoin: cfg.adRewardCoin,
+        remaining: Math.max(0, cfg.adDailyLimit - (usedToday + 1)),
+        state: await requireState(ctx, cfg),
+      };
+    }),
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Admin panel — separate password session, cookie-scoped
+// ─────────────────────────────────────────────────────────────────────────────
+const adminOnly = middleware(async ({ ctx, next }) => {
+  const token = getCookie(ctx.c, ADMIN_COOKIE);
+  if (!token) throw new TRPCError({ code: "UNAUTHORIZED", message: "Admin sign-in required." });
+  const session = await q.getAdminSession(token);
+  if (!session) {
+    throw new TRPCError({ code: "UNAUTHORIZED", message: "Admin session expired — sign in again." });
+  }
+  return next();
+});
+
+const adminGuard = publicProcedure.use(adminOnly);
+
+async function readAdminPasswordHash(): Promise<string | null> {
+  const overrides = await q.getConfigOverrides();
+  const stored = overrides["admin.passwordHash"];
+  return typeof stored === "string" ? stored : null;
+}
+
+const adminRouter = router({
+  login: publicProcedure
+    .input(z.object({ password: z.string().min(1) }))
+    .mutation(async ({ ctx, input }) => {
+      const stored = await readAdminPasswordHash();
+      const ok = stored
+        ? await bcrypt.compare(input.password, stored)
+        : input.password === DEFAULT_ADMIN_PASSWORD;
+
+      if (!ok) {
+        throw new TRPCError({ code: "UNAUTHORIZED", message: "Incorrect panel password." });
+      }
+      if (!stored) {
+        // First successful sign-in pins the default's hash, so the password can
+        // then be rotated from inside the panel.
+        await q.setSetting("admin.passwordHash", await bcrypt.hash(input.password, 10));
+      }
+      const token = crypto.randomUUID().replace(/-/g, "") + crypto.randomUUID().replace(/-/g, "");
+      await q.createAdminSession(token, ctx.user?.id ?? null);
+      setCookie(ctx.c, ADMIN_COOKIE, token, {
+        httpOnly: true,
+        sameSite: "Lax",
+        path: "/",
+        maxAge: 12 * 3600,
+      });
+      return { ok: true, usingDefaultPassword: !stored };
+    }),
+
+  logout: adminGuard.mutation(async ({ ctx }) => {
+    const token = getCookie(ctx.c, ADMIN_COOKIE);
+    if (token) await q.deleteAdminSession(token);
+    deleteCookie(ctx.c, ADMIN_COOKIE, { path: "/" });
+    return { ok: true };
+  }),
+
+  me: publicProcedure.query(async ({ ctx }) => {
+    const token = getCookie(ctx.c, ADMIN_COOKIE);
+    if (!token) return { signedIn: false };
+    const session = await q.getAdminSession(token);
+    if (!session) return { signedIn: false };
+    const overrides = await q.getConfigOverrides();
+    return {
+      signedIn: true,
+      usingDefaultPassword: !overrides["admin.passwordHash"],
+    };
+  }),
+
+  changePassword: adminGuard
+    .input(z.object({ password: z.string().min(6).max(128) }))
+    .mutation(async ({ input }) => {
+      await q.setSetting("admin.passwordHash", await bcrypt.hash(input.password, 10));
+      return { ok: true };
+    }),
+
+  stats: adminGuard.query(() => q.adminStats()),
+
+  getConfig: adminGuard.query(async () => {
+    const overrides = await q.getConfigOverrides();
+    const cfg = resolveConfig(overrides);
+    // Never ship the password hash to the client.
+    const exposedOverrides = { ...overrides };
+    delete exposedOverrides["admin.passwordHash"];
+    return {
+      config: cfg,
+      overrides: exposedOverrides,
+      defaults: resolveConfig(null),
+      hasTonTreasury: !!cfg.treasureTonAddress && isTonAddress(cfg.treasureTonAddress),
+    };
+  }),
+
+  setConfig: adminGuard
+    .input(z.object({ path: z.string().min(1), value: z.unknown() }))
+    .mutation(async ({ input }) => {
+      await q.setSetting(input.path, input.value);
+      const cfg = await q.getConfig();
+      return { ok: true, config: cfg };
+    }),
+
+  setConfigBulk: adminGuard
+    .input(z.object({ values: z.record(z.string(), z.unknown()) }))
+    .mutation(async ({ input }) => {
+      for (const [path, value] of Object.entries(input.values)) {
+        await q.setSetting(path, value);
+      }
+      return { ok: true, config: await q.getConfig() };
+    }),
+
+  resetConfig: adminGuard
+    .input(z.object({ path: z.string().min(1) }))
+    .mutation(async ({ input }) => {
+      // Write the code default back, which is the same as clearing the override.
+      const def = resolveConfig(null) as unknown as Record<string, unknown>;
+      const value = input.path.split(".").reduce<unknown>((a, k) => {
+        if (a === null || a === undefined) return undefined;
+        return (a as Record<string, unknown>)[k];
+      }, def);
+      await q.setSetting(input.path, value);
+      return { ok: true, config: await q.getConfig() };
+    }),
+
+  users: adminGuard
+    .input(z.object({ limit: z.number().int().min(1).max(500).default(100), offset: z.number().int().min(0).default(0) }).optional())
+    .query(({ input }) => q.listUsersForAdmin(input?.limit ?? 100, input?.offset ?? 0)),
+
+  adjust: adminGuard
+    .input(
+      z.object({
+        userId: z.string().min(1),
+        deltaCoin: z.number().int().default(0),
+        deltaTon: z.number().default(0),
+        note: z.string().max(200).default("Admin adjustment"),
+      }),
+    )
+    .mutation(async ({ input }) => {
+      await q.adminAdjustCoins(
+        input.userId,
+        input.deltaCoin,
+        Math.round(input.deltaTon * NANO),
+        input.note,
+      );
+      return { ok: true };
+    }),
+
+  ledger: adminGuard
+    .input(z.object({ limit: z.number().int().min(1).max(500).default(100) }).optional())
+    .query(async ({ input }) => {
+      const rows = await q.listAllLedger(input?.limit ?? 100);
+      return rows.map((r) => ({
+        id: r.id,
+        userId: r.userId,
+        handle: r.handle,
+        email: r.email,
+        kind: r.kind,
+        deltaCoin: Number(r.deltaCoin),
+        deltaNanoTon: Number(r.deltaNanoTon),
+        note: r.note,
+        createdAt: r.createdAt.toISOString(),
+      }));
+    }),
+
+  shop: adminGuard.query(async () => {
+    const items = await q.listShopItems(false);
+    return items.map((i) => ({
+      ...i,
+      coinPrice: Number(i.coinPrice),
+      createdAt: i.createdAt.toISOString(),
+    }));
+  }),
+
+  saveShopItem: adminGuard
+    .input(
+      z.object({
+        slug: z.string().min(1).max(64),
+        name: z.string().min(1).max(120),
+        description: z.string().max(400).default(""),
+        category: z.enum(["skin", "button"]),
+        tierIndex: z.number().int().min(0).max(20),
+        tier: z.string().min(1).max(40),
+        priceUsdtCents: z.number().int().min(0).max(1_000_000),
+        coinPrice: z.number().int().min(0).max(1_000_000_000_000),
+        boostPercent: z.number().int().min(0).max(500),
+        imageUrl: z.string().min(1).max(300),
+        active: z.boolean(),
+      }),
+    )
+    .mutation(async ({ input }) => {
+      await q.upsertShopItemSafe(input);
+      return { ok: true };
+    }),
+
+  deleteShopItem: adminGuard
+    .input(z.object({ slug: z.string().min(1) }))
+    .mutation(async ({ input }) => {
+      await q.deleteShopItemBySlug(input.slug);
+      return { ok: true };
+    }),
+
+  offers: adminGuard.query(async () => {
+    const rows = await q.listOffers(false);
+    return rows.map((o) => ({
+      ...o,
+      rewardCoin: Number(o.rewardCoin),
+      bonusNanoTon: Number(o.bonusNanoTon),
+      createdAt: o.createdAt.toISOString(),
+    }));
+  }),
+
+  saveOffer: adminGuard
+    .input(
+      z.object({
+        slug: z.string().min(1).max(64),
+        title: z.string().min(1).max(160),
+        description: z.string().max(400).default(""),
+        url: z.string().max(400).default(""),
+        icon: z.string().max(8).default("🎯"),
+        kind: z.enum(["channel", "task", "ad"]),
+        rule: z.enum(["manual", "wallet", "purchase", "withdrawal", "ad", "referrals", "league"]),
+        ruleValue: z.number().int().min(0).max(1_000_000).default(0),
+        rewardCoin: z.number().int().min(0).max(1_000_000_000),
+        bonusTon: z.number().min(0).max(1000).default(0),
+        ctaLabel: z.string().max(40).default("Claim"),
+        active: z.boolean(),
+        sortOrder: z.number().int().default(0),
+      }),
+    )
+    .mutation(async ({ input }) => {
+      await q.upsertOfferSafe(input);
+      return { ok: true };
+    }),
+
+  deleteOffer: adminGuard
+    .input(z.object({ slug: z.string().min(1) }))
+    .mutation(async ({ input }) => {
+      await q.deleteOfferBySlug(input.slug);
+      return { ok: true };
+    }),
+
+  withdrawals: adminGuard.query(async () => {
+    const rows = await q.listAllWithdrawals();
+    return rows.map((r) => ({
+      ...r,
+      amountNanoTon: Number(r.amountNanoTon),
+      netNanoTon: Number(r.netNanoTon),
+      feeNanoTon: Number(r.feeNanoTon),
+      createdAt: r.createdAt.toISOString(),
+    }));
+  }),
+
+  purchases: adminGuard.query(async () => {
+    const rows = await q.listAllPurchases();
+    return rows.map((r) => ({ ...r, createdAt: r.createdAt.toISOString() }));
+  }),
+
+  setWithdrawalStatus: adminGuard
+    .input(
+      z.object({
+        id: z.string().min(1),
+        status: z.enum(["pending", "processing", "completed", "failed"]),
+        txHash: z.string().max(200).optional(),
+        failReason: z.string().max(300).optional(),
+      }),
+    )
+    .mutation(async ({ input }) => {
+      await q.setWithdrawalStatusAdmin(input.id, {
+        status: input.status,
+        txHash: input.txHash ?? null,
+        failReason: input.failReason ?? null,
+      });
+      return { ok: true };
+    }),
+
+  board: adminGuard.query(async () => ({
+    seedCount: await q.countLeaderboardSeed(),
+  })),
+
+  seedBoard: adminGuard
+    .input(z.object({ count: z.number().int().min(0).max(60).default(20) }))
+    .mutation(async ({ input }) => {
+      await q.clearLeaderboardSeed();
+      if (input.count === 0) return { ok: true, inserted: 0 };
+      const handles = [
+        "NovaMiner","LunaTap","CryptoHawk","ZenithKing","PixelPirate","AquaByte","VoltRider",
+        "StarForge","NebulaX","IronPulse","GhostCoin","SolarFlare","ByteBaron","QuantumFox",
+        "TurboNaut","EchoStorm","NeonDrift","OrbitKid","PlasmaPug","AlphaWolf","HyperIon",
+        "DeltaNode","CosmoApe","RiftWalker","AuroraSky","TitanCore","VertexOwl","ZephyrJet",
+        "OnyxBear","PrismCat",
+      ];
+      const avatars = ["⛏️","💎","🚀","🔥","⚡","👑","🎯","🌙","🦅","🐺"];
+      const cfg = await q.getConfig();
+      const rows = Array.from({ length: input.count }, (_, i) => {
+        const coins = Math.max(2_000, Math.round(120_000 / (i + 1) ** 0.55));
+        let leagueIndex = 0;
+        cfg.leagueThresholds.forEach((t, li) => {
+          if (coins >= t) leagueIndex = li;
+        });
+        return {
+          handle: handles[i % handles.length]!,
+          avatar: avatars[i % avatars.length]!,
+          weekCoinMined: coins,
+          leagueIndex,
+        };
+      });
+      await q.seedLeaderboard(rows);
+      return { ok: true, inserted: rows.length };
+    }),
+
+  clearBoard: adminGuard.mutation(async () => {
+    await q.clearLeaderboardSeed();
+    return { ok: true };
+  }),
+
+  seedCatalogue: adminGuard.mutation(async () => {
+    const res = await seedCatalogue();
+    return { ok: true, ...res };
+  }),
+
+  clearPendingWithdrawal: adminGuard
+    .input(z.object({ id: z.string().min(1) }))
+    .mutation(async ({ input }) => {
+      await q.releaseWithdrawalLock(input.id);
+      return { ok: true };
+    }),
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 export const appRouter = router({
   auth: authRouter,
-  items: itemsRouter,
+  game: gameRouter,
+  wallet: walletRouter,
+  shop: shopRouter,
+  withdrawal: withdrawalRouter,
+  referral: referralRouter,
+  leaderboard: leaderboardRouter,
+  offers: offersRouter,
+  ads: adsRouter,
+  admin: adminRouter,
   files: filesRouter,
 });
 
 export type AppRouter = typeof appRouter;
+

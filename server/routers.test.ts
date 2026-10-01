@@ -29,10 +29,28 @@ vi.mock("./_core/storage", () => ({
   },
 }));
 
-vi.mock("./db", () => ({
-  listItemsByOwner: vi.fn(),
-  createItem: vi.fn(),
-  deleteItem: vi.fn(),
+// The game's routers are backed by real queries; the tests below only exercise
+// auth.signup and files.remove, so every data-access export is stubbed.
+vi.mock("./db", () => {
+  const noop = vi.fn();
+  return new Proxy(
+    {},
+    {
+      get: (_t, prop: string) => {
+        if (prop === "then") return undefined; // not a thenable
+        return noop;
+      },
+    },
+  );
+});
+
+vi.mock("./services/seed", () => ({ seedCatalogue: vi.fn() }));
+vi.mock("./services/ton", () => ({
+  assertTonTreasury: vi.fn(),
+  commentPayload: vi.fn(() => ""),
+  isTonAddress: vi.fn(() => false),
+  nanoTonToTonString: vi.fn(() => "0"),
+  verifyTonProof: vi.fn(async () => true),
 }));
 
 const { sanitizeBasename } = await import("./routers");
@@ -133,7 +151,7 @@ describe("files.remove", () => {
       user: { id: "user-1" } as never,
     });
 
-    const err = await caller.files.remove({ key: "../evil.pdf" }).catch((e) => e);
+    const err = await caller.files.remove({ key: "../evil.pdf" }).catch((e: unknown) => e);
 
     expect(err).toBeInstanceOf(TRPCError);
     expect((err as TRPCError).code).toBe("BAD_REQUEST");

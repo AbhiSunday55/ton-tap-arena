@@ -1,0 +1,1 @@
+ALTER TABLE "player_profiles" ADD COLUMN "rig_accrued_at" timestamp with time zone DEFAULT now() NOT NULL;

@@ -1,58 +1,69 @@
 @import "tailwindcss";
 @import "tw-animate-css";
+@import "./game.css";
 
-/* Tailwind v4 is CSS-first: no tailwind.config / postcss / autoprefixer.
-   Dark mode is class-based (add `dark` on <html>/<body>); shadcn/ui token set. */
+/* Tailwind v4 is CSS-first. The scaffold's stock slate theme is REPLACED here
+   with the TON Tap Arena palette so every shadcn/ui primitive inherits it. */
 @custom-variant dark (&:is(.dark *));
 
 :root {
-  --radius: 0.5rem;
-  --background: hsl(0 0% 100%);
-  --foreground: hsl(222.2 84% 4.9%);
-  --card: hsl(0 0% 100%);
-  --card-foreground: hsl(222.2 84% 4.9%);
-  --primary: hsl(222.2 47.4% 11.2%);
-  --primary-foreground: hsl(210 40% 98%);
-  --secondary: hsl(210 40% 96.1%);
-  --secondary-foreground: hsl(222.2 47.4% 11.2%);
-  --muted: hsl(210 40% 96.1%);
-  --muted-foreground: hsl(215.4 16.3% 46.9%);
-  --accent: hsl(210 40% 96.1%);
-  --accent-foreground: hsl(222.2 47.4% 11.2%);
-  --destructive: hsl(0 84.2% 60.2%);
-  --destructive-foreground: hsl(210 40% 98%);
-  --border: hsl(214.3 31.8% 91.4%);
-  --input: hsl(214.3 31.8% 91.4%);
-  --ring: hsl(222.2 84% 4.9%);
+  --radius: 1rem;
+
+  /* ── arena palette (light is unused; the app is dark-only by design) ── */
+  --background: #070b16;
+  --foreground: #e9eefb;
+  --card: #131c31;
+  --card-foreground: #e9eefb;
+  --popover: #0f1728;
+  --popover-foreground: #e9eefb;
+  --primary: #f7c948;
+  --primary-foreground: #1a1200;
+  --secondary: #1c2844;
+  --secondary-foreground: #e9eefb;
+  --muted: #1c2844;
+  --muted-foreground: #8a9ac2;
+  --accent: #2ee6d6;
+  --accent-foreground: #04211f;
+  --destructive: #ff5c72;
+  --destructive-foreground: #2a0208;
+  --border: rgba(122, 152, 222, 0.22);
+  --input: rgba(122, 152, 222, 0.28);
+  --ring: #f7c948;
+
+  /* ── game tokens ── */
+  --bg: #070b16;
+  --bg-2: #0b1224;
+  --surface: rgba(19, 28, 49, 0.74);
+  --surface-2: rgba(28, 40, 68, 0.86);
+  --surface-3: rgba(38, 52, 86, 0.9);
+  --line: rgba(122, 152, 222, 0.16);
+  --line-2: rgba(122, 152, 222, 0.28);
+  --gold: #f7c948;
+  --gold-2: #ffe08a;
+  --gold-deep: #b8860b;
+  --cyan: #2ee6d6;
+  --cyan-2: #7ff5ea;
+  --blue: #4b8cff;
+  --violet: #a06bff;
+  --text: #e9eefb;
+  --muted-ink: #8a9ac2;
+  --muted-2: #5f6f96;
+  --danger: #ff5c72;
+  --ok: #3ddc97;
+  --r-lg: 22px;
+  --r: 16px;
+  --r-sm: 11px;
+  --shadow: 0 18px 44px rgba(0, 0, 0, 0.55);
+  --tab-h: 74px;
 }
 
-.dark {
-  --background: hsl(222.2 84% 4.9%);
-  --foreground: hsl(210 40% 98%);
-  --card: hsl(222.2 84% 4.9%);
-  --card-foreground: hsl(210 40% 98%);
-  --primary: hsl(210 40% 98%);
-  --primary-foreground: hsl(222.2 47.4% 11.2%);
-  --secondary: hsl(217.2 32.6% 17.5%);
-  --secondary-foreground: hsl(210 40% 98%);
-  --muted: hsl(217.2 32.6% 17.5%);
-  --muted-foreground: hsl(215 20.2% 65.1%);
-  --accent: hsl(217.2 32.6% 17.5%);
-  --accent-foreground: hsl(210 40% 98%);
-  --destructive: hsl(0 62.8% 30.6%);
-  --destructive-foreground: hsl(210 40% 98%);
-  --border: hsl(217.2 32.6% 17.5%);
-  --input: hsl(217.2 32.6% 17.5%);
-  --ring: hsl(212.7 26.8% 83.9%);
-}
-
-/* Map design tokens to Tailwind's theme so utilities (bg-primary, border-border,
-   rounded-lg, …) resolve. @theme inline references the vars above unwrapped. */
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
   --color-card: var(--card);
   --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
   --color-primary: var(--primary);
   --color-primary-foreground: var(--primary-foreground);
   --color-secondary: var(--secondary);
@@ -70,13 +81,28 @@
   --radius-md: calc(var(--radius) - 2px);
   --radius-lg: var(--radius);
   --radius-xl: calc(var(--radius) + 4px);
+  --font-sans: "Outfit", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
 
-@layer base {
-  * {
-    @apply border-border;
-  }
-  body {
-    @apply bg-background text-foreground;
-  }
+* {
+  border-color: var(--border);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: #03060d;
+  color: var(--foreground);
+  font-family: var(--font-sans);
+}
+
+/* the app owns its own scroll containers */
+::-webkit-scrollbar {
+  width: 0;
+  height: 0;
 }
