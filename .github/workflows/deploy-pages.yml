@@ -36,7 +36,10 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          # Node 22, not 20: package.json pins pnpm 11.15.1, which requires
+          # Node >= 22.13. On Node 20 pnpm dies with "No such built-in module:
+          # node:sqlite" before it can install anything.
+          node-version: 22
         # No `cache: pnpm` on purpose: the cache step shells out to `pnpm store
         # path` and fails the job when it cannot resolve the store. Installing
         # without the cache is a few seconds slower and always works.
