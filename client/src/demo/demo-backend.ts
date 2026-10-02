@@ -110,7 +110,6 @@ interface DemoProfile {
   walletConnectedAt: string | null;
   withdrawalPending: boolean;
   soundEnabled: boolean;
-  isAdmin: boolean;
   createdAt: string;
 }
 
@@ -203,7 +202,6 @@ function freshState(): DemoState {
       walletConnectedAt: null,
       withdrawalPending: false,
       soundEnabled: true,
-      isAdmin: false,
       createdAt: now.toISOString(),
     },
     owned: [],
@@ -419,7 +417,6 @@ function buildState() {
         turbo: false,
       }),
       soundEnabled: p.soundEnabled,
-      isAdmin: false,
       walletAddress: p.walletAddress,
       walletProvider: p.walletProvider,
       proofVerified: !!p.proofVerifiedAt,
@@ -956,7 +953,7 @@ function watchAd(completed: boolean, watchedSeconds: number) {
   const s = load();
   const p = sync();
   if (!cfg.adEnabled) throw new Error("Ads are currently disabled.");
-  // Mirrors the server: a completed network callback OR a full simulated watch.
+  // Mirrors the server: a completed network callback OR a full standby watch.
   if (!completed && watchedSeconds < cfg.adWatchSeconds) {
     throw new Error(`Watch the full ${cfg.adWatchSeconds}s to earn the reward.`);
   }

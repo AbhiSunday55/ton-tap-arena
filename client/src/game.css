@@ -2,7 +2,7 @@
    TON TAP ARENA — component layer.
    The visual language of the original static build (phone shell, glassy
    surface cards, gold/cyan accents, bottom tab bar), preserved and extended
-   with the wallet / leaderboard / ads / admin surfaces.
+   with the wallet / leaderboard / ads surfaces.
    ══════════════════════════════════════════════════════════════════════════ */
 
 html,
@@ -908,184 +908,6 @@ a {
 .loss {
   color: var(--danger);
 }
-/* — admin panel — */
-/*
- * The admin panel is a deliberately plainer, denser surface than the game: it is
- * an operator tool, and legibility beats spectacle. It stays on the same dark
- * navy/gold tokens so it does not read as a different product, but drops the
- * glow effects and uses a denser type scale.
- */
-.admin-wrap {
-  max-width: 1180px;
-  margin: 0 auto;
-  padding: 22px 16px 80px;
-}
-.admin-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  flex-wrap: wrap;
-  margin-bottom: 18px;
-}
-.admin-head h1 {
-  font-size: 20px;
-  font-weight: 900;
-  letter-spacing: -0.3px;
-}
-.admin-head .sub {
-  font-size: 11.5px;
-  color: var(--muted-ink);
-  margin-top: 3px;
-  font-weight: 600;
-}
-.admin-card {
-  background: var(--surface);
-  border: 1px solid var(--line);
-  border-radius: var(--r-lg);
-  padding: 16px;
-  margin-bottom: 14px;
-}
-.admin-card > h2 {
-  font-size: 13px;
-  font-weight: 900;
-  letter-spacing: 0.3px;
-  text-transform: uppercase;
-  color: var(--gold-2);
-  margin-bottom: 12px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-.admin-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
-  gap: 12px;
-}
-.admin-field {
-  display: flex;
-  flex-direction: column;
-  gap: 5px;
-}
-.admin-field > label {
-  font-size: 10.5px;
-  font-weight: 800;
-  letter-spacing: 0.4px;
-  text-transform: uppercase;
-  color: var(--muted-ink);
-}
-.admin-field > .help {
-  font-size: 9.5px;
-  color: rgba(150, 167, 199, 0.75);
-  line-height: 1.4;
-}
-.admin-field input,
-.admin-field select,
-.admin-field textarea {
-  width: 100%;
-  background: rgba(8, 13, 25, 0.85);
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  color: var(--ink);
-  font-size: 12.5px;
-  font-weight: 700;
-  font-family: inherit;
-  padding: 9px 11px;
-  line-height: 1.35;
-}
-.admin-field input:focus,
-.admin-field select:focus,
-.admin-field textarea:focus {
-  outline: none;
-  border-color: var(--cyan);
-  box-shadow: 0 0 0 3px rgba(69, 214, 255, 0.16);
-}
-.admin-field input[type="checkbox"] {
-  width: 18px;
-  height: 18px;
-  accent-color: var(--cyan);
-}
-.admin-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 11.5px;
-}
-.admin-table th {
-  text-align: left;
-  font-size: 9.5px;
-  font-weight: 900;
-  letter-spacing: 0.5px;
-  text-transform: uppercase;
-  color: var(--muted-ink);
-  padding: 7px 9px;
-  border-bottom: 1px solid var(--line);
-  white-space: nowrap;
-}
-.admin-table td {
-  padding: 8px 9px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.045);
-  font-weight: 650;
-  vertical-align: middle;
-}
-.admin-table tr:hover td {
-  background: rgba(255, 255, 255, 0.022);
-}
-.admin-table .num {
-  text-align: right;
-  font-variant-numeric: tabular-nums;
-}
-.admin-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-}
-.admin-tabs {
-  display: flex;
-  gap: 6px;
-  flex-wrap: wrap;
-  margin-bottom: 16px;
-}
-.admin-tabs button {
-  background: rgba(255, 255, 255, 0.045);
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  color: var(--muted-ink);
-  font-size: 11.5px;
-  font-weight: 800;
-  font-family: inherit;
-  padding: 8px 15px;
-  cursor: pointer;
-  transition: all 0.16s ease;
-}
-.admin-tabs button.on {
-  background: linear-gradient(180deg, var(--gold-2), var(--gold));
-  border-color: transparent;
-  color: #23180a;
-  box-shadow: 0 5px 16px rgba(240, 188, 80, 0.3);
-}
-.admin-scroll {
-  max-height: 60vh;
-  overflow: auto;
-  border-radius: 12px;
-}
-.admin-scroll::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
-}
-.admin-scroll::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.14);
-  border-radius: 999px;
-}
-@media (max-width: 720px) {
-  .admin-grid {
-    grid-template-columns: 1fr;
-  }
-  .admin-wrap {
-    padding: 16px 12px 70px;
-  }
-}
-
 .foot-note {
   margin-top: 22px;
   font-size: 9.5px;
@@ -1719,31 +1541,6 @@ a {
 }
 
 /* ─────────────────────────── admin ─────────────────────────── */
-.admin-wrap {
-  min-height: 100dvh;
-  overflow-y: auto;
-  padding: 20px 16px 60px;
-  max-width: 1080px;
-  margin: 0 auto;
-}
-.admin-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  flex-wrap: wrap;
-  margin-bottom: 18px;
-}
-.admin-head h1 {
-  font-size: 22px;
-  font-weight: 900;
-  margin: 0;
-}
-.admin-head .s {
-  font-size: 12px;
-  color: var(--muted-ink);
-  margin-top: 4px;
-}
 .stat-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
@@ -1767,26 +1564,6 @@ a {
   font-size: 21px;
   font-weight: 900;
   margin-top: 5px;
-  color: var(--gold-2);
-}
-.admin-tabs {
-  display: flex;
-  gap: 7px;
-  flex-wrap: wrap;
-  margin-bottom: 16px;
-}
-.admin-tabs button {
-  padding: 8px 13px;
-  border-radius: var(--r-sm);
-  font-size: 11.5px;
-  font-weight: 800;
-  background: var(--surface);
-  border: 1px solid var(--line);
-  color: var(--muted-ink);
-}
-.admin-tabs button.on {
-  background: linear-gradient(135deg, rgba(247, 201, 72, 0.22), rgba(247, 201, 72, 0.06));
-  border-color: rgba(247, 201, 72, 0.5);
   color: var(--gold-2);
 }
 .group-title {

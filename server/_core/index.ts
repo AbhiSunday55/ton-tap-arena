@@ -10,6 +10,7 @@ import { serveAppStorage } from "./storage";
 import { getJob } from "./jobs";
 import { mountClient } from "./serve";
 import { env } from "./env";
+import { startPanelConfigPolling } from "../db";
 
 // Single process: tRPC API + scoped storage proxy + job callbacks + (prod) SPA.
 const app = new Hono();
@@ -55,5 +56,10 @@ mountClient(app);
 
 const port = env.isProd ? env.port : env.apiPort;
 serve({ fetch: app.fetch, port });
+
+// Keep the controller panel's config warm in the background, so a player request
+// almost never pays for a panel round trip. A no-op while no panel is configured.
+startPanelConfigPolling();
+
 // eslint-disable-next-line no-console
 console.log(`[server] listening on :${port} (${env.isProd ? "prod" : "dev-api"})`);

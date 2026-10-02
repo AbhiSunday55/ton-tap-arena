@@ -41,13 +41,4 @@ export type WithdrawalRequestResult = Out["withdrawal"]["request"];
 export type WithdrawalRow = Out["withdrawal"]["list"][number];
 export type LedgerRow = Out["wallet"]["ledger"][number];
 
-export type AdminStats = Out["admin"]["stats"];
-export type AdminConfigPayload = Out["admin"]["getConfig"];
-export type AdminUserRow = Out["admin"]["users"][number];
-export type AdminLedgerRow = Out["admin"]["ledger"][number];
-export type AdminWithdrawalRow = Out["admin"]["withdrawals"][number];
-export type AdminShopRow = Out["admin"]["shop"][number];
-export type AdminOfferRow = Out["admin"]["offers"][number];
-export type AdminPurchaseRow = Out["admin"]["purchases"][number];
-
 export type { Out as RouterOutputs };

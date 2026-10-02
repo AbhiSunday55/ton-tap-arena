@@ -14,7 +14,7 @@ import { showRewardedAd } from "./adsgram";
  *                    `show()` resolves, which Adsgram does when the ad was
  *                    watched to the end. A skip, close or error rejects and
  *                    grants nothing.
- *  - `placeholder` — the built-in simulated slot, kept for the standalone demo
+ *  - `placeholder` — the built-in standby slot, kept for the standalone
  *                    build where no ad network can run.
  *
  * Every failure surfaces as a visible message. The old flow failed silently,
@@ -25,7 +25,7 @@ export interface AdRewardApi {
   loading: boolean;
   /** An ad is being requested or is on screen. */
   playing: boolean;
-  /** Remaining seconds of the simulated slot (placeholder provider only). */
+  /** Remaining seconds of the standby slot (placeholder provider only). */
   countdown: number | null;
   /** Player-facing failure text, or null. */
   error: string | null;
@@ -111,13 +111,13 @@ export function useAdReward(active: boolean): AdRewardApi {
       return;
     }
 
-    // ── Simulated slot (standalone demo build) ──
+    // ── Standby slot (standalone build) ──
     elapsedRef.current = 0;
     setCountdown(status.watchSeconds);
     sfx("turbo");
   }, [status, grant, fail, sfx]);
 
-  // The simulated countdown earns the reward only when it reaches zero.
+  // The standby countdown earns the reward only when it reaches zero.
   useEffect(() => {
     if (countdown === null) return;
     if (countdown <= 0) {

@@ -36,6 +36,13 @@ export const env = {
     presignUrl: process.env.APP_STORAGE_PRESIGN_URL ?? "",
     token: process.env.APP_STORAGE_TOKEN ?? "",
   },
+  // ── controller panel bridge ──
+  // SERVER-ONLY address of the separate operator console. When set, the server
+  // polls its public config and merges it so the console can retune the game
+  // with no redeploy. It is deliberately NOT part of `GameConfig`'s client
+  // payload and is filtered out of every client-facing config read, so the
+  // console's address can never be discovered from the game.
+  panelUrl: process.env.PANEL_URL ?? "",
   // ── Telegram Mini App ──
   // SERVER-SIDE ONLY. The bot token is the HMAC key that proves an `initData`
   // payload really came from Telegram, so it must never reach the browser: it is

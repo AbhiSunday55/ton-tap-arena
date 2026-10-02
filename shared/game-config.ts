@@ -450,6 +450,61 @@ export function setPath(obj: Record<string, unknown>, path: string, value: unkno
   cur[parts[parts.length - 1]!] = value;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Controller-panel bridge
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Config paths a controller panel may contribute. Derived from CONFIG_FIELDS so
+ *  the set cannot silently widen: a path an operator can edit is exactly a path
+ *  the console may tune. */
+export function panelWritablePaths(): Set<string> {
+  return new Set<string>(CONFIG_FIELDS.map((f) => f.path));
+}
+
+function isPanelScalar(v: unknown): boolean {
+  return typeof v === "string" || typeof v === "number" || typeof v === "boolean";
+}
+
+/**
+ * Keep only the part of a panel payload this app is willing to accept.
+ *
+ * The panel is a separate deployment, so its response is UNTRUSTED input. Only
+ * scalars and flat scalar arrays survive; a nested object is dropped rather than
+ * merged blind, because it could otherwise replace a whole config subtree or
+ * introduce a path that is not a real tunable. Secret paths are refused
+ * outright, so a compromised console can never hand this app a bot token.
+ */
+export function sanitizePanelConfig(
+  raw: unknown,
+  allowed: Set<string> = panelWritablePaths(),
+): Record<string, unknown> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const secrets = new Set<string>(SECRET_CONFIG_PATHS);
+  const out: Record<string, unknown> = {};
+  for (const [path, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (value === undefined) continue;
+    if (secrets.has(path)) continue;
+    if (!allowed.has(path)) continue;
+    if (isPanelScalar(value) || (Array.isArray(value) && value.every(isPanelScalar))) {
+      out[path] = value;
+    }
+  }
+  return out;
+}
+
+/**
+ * Fold config layers in precedence order: the panel first, then this app's own
+ * overrides last. Local settings win on purpose — the game's own configuration
+ * is authoritative and the console is a convenience remote control, so an
+ * operator sitting in front of the game can always correct a bad panel value.
+ */
+export function mergeConfigLayers(
+  panel: Record<string, unknown> | null | undefined,
+  local: Record<string, unknown> | null | undefined,
+): Record<string, unknown> {
+  return { ...sanitizePanelConfig(panel), ...(local ?? {}) };
+}
+
 /**
  * Layer sparse admin overrides (one row per dotted path) over the defaults.
  * An override whose value no longer parses is ignored rather than crashing the

@@ -21,7 +21,7 @@ import {
   users,
   withdrawals,
 } from "../drizzle/schema";
-import { resolveConfig, type GameConfig } from "../shared/game-config";
+import { mergeConfigLayers, resolveConfig, type GameConfig } from "../shared/game-config";
 import { tierEffects } from "../shared/item-effects";
 
 export type Profile = typeof playerProfiles.$inferSelect;
@@ -49,7 +49,14 @@ export async function getConfigOverrides(): Promise<Record<string, unknown>> {
  * can rotate them from the admin panel, but filtered out of every client-facing
  * config read.
  */
-export const SECRET_SETTING_KEYS = new Set(["telegramBotToken", "telegramClientSecret"]);
+export const SECRET_SETTING_KEYS = new Set([
+  "telegramBotToken",
+  "telegramClientSecret",
+  // The controller panel's address is server-only. Publishing it would hand a
+  // player the one thing this product deliberately never exposes, so it is
+  // filtered out of every client-facing config read exactly like a token.
+  "panelUrl",
+]);
 
 /** Read a secret setting, or undefined when it has never been set. */
 export async function getSecretSetting(key: string): Promise<string | undefined> {
@@ -77,7 +84,131 @@ export async function resolveTelegramBotToken(): Promise<string> {
 }
 
 export async function getConfig(): Promise<GameConfig> {
-  return resolveConfig(await getConfigOverrides());
+  const overrides = await getConfigOverrides();
+  const panelUrl = await resolvePanelUrl();
+  const panel = await getPanelConfig(panelUrl);
+  // Panel first, local settings last: this app's own configuration wins.
+  return resolveConfig(mergeConfigLayers(panel, overrides));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Controller-panel bridge
+//
+// The operator console is a SEPARATE deployment. When its address is configured
+// the game polls its public config and folds the result into the same override
+// layer the `settings` table feeds, so the console can retune rewards, energy,
+// combo, boosters, leagues, fees, the ad block ID, the banner and maintenance
+// mode with no redeploy.
+//
+// Three properties matter here and each is deliberate:
+//   * the response is UNTRUSTED (a different host, possibly compromised), so it
+//     is sanitised down to known scalar paths before it is merged;
+//   * a slow or dead panel must never make the game slow or dead, so every
+//     fetch is bounded by an abort timeout and a failure falls back to the last
+//     good values;
+//   * the poll runs on the server, never in a player's browser, so the panel's
+//     address never leaves this process.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** How often the cache is considered stale. */
+const PANEL_CACHE_TTL_MS = 60_000;
+/** How often the background poller refreshes it, so requests rarely pay. */
+const PANEL_POLL_MS = 60_000;
+/** Hard ceiling on one panel request. A dead panel costs this, once. */
+const PANEL_TIMEOUT_MS = 4_000;
+
+let panelCache: { fetchedAt: number; config: Record<string, unknown> } | null = null;
+let panelInflight: Promise<Record<string, unknown>> | null = null;
+let panelTimer: ReturnType<typeof setInterval> | null = null;
+
+/**
+ * The panel address: a `settings` override wins, else the environment.
+ *
+ * Read through `getSecretSetting` rather than the override map on purpose —
+ * `panelUrl` is in SECRET_SETTING_KEYS, so the override reader (which feeds the
+ * client-facing config) deliberately omits it.
+ */
+export async function resolvePanelUrl(): Promise<string | undefined> {
+  const stored = await getSecretSetting("panelUrl");
+  if (stored) return stored.trim();
+  const { env } = await import("./_core/env");
+  const fromEnv = env.panelUrl;
+  return fromEnv && fromEnv.trim() ? fromEnv.trim() : undefined;
+}
+
+/**
+ * Pull the config object out of the panel's superjson response:
+ * `{ result: { data: { json: { config, updatedAt } } } }`. Both the batch
+ * (array) and single (object) `result` shapes are accepted, because tRPC emits
+ * an array for a batched call and an object otherwise.
+ */
+function extractPanelConfig(payload: unknown): Record<string, unknown> {
+  const body = payload as { result?: unknown } | null;
+  const result = body?.result;
+  const envelope = Array.isArray(result) ? result[0] : result;
+  const data = (envelope as { data?: unknown } | undefined)?.data as
+    | { json?: { config?: unknown }; config?: unknown }
+    | undefined;
+  const candidate = data?.json?.config ?? data?.config;
+  return candidate && typeof candidate === "object" && !Array.isArray(candidate)
+    ? (candidate as Record<string, unknown>)
+    : {};
+}
+
+async function fetchPanelConfig(panelUrl: string): Promise<Record<string, unknown>> {
+  const url = `${panelUrl.replace(/\/+$/, "")}/trpc/config.public`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), PANEL_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, {
+      signal: controller.signal,
+      headers: { accept: "application/json" },
+    });
+    if (!res.ok) return panelCache?.config ?? {};
+    return extractPanelConfig(await res.json());
+  } catch {
+    // Unreachable, slow or non-JSON panel: keep serving the last good values
+    // (or none) rather than failing the request that happened to trigger this.
+    return panelCache?.config ?? {};
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** The panel's config, cached. Never throws; never waits longer than the timeout. */
+export async function getPanelConfig(panelUrl: string | undefined): Promise<Record<string, unknown>> {
+  if (!panelUrl) return {};
+  if (panelCache && Date.now() - panelCache.fetchedAt < PANEL_CACHE_TTL_MS) {
+    return panelCache.config;
+  }
+  if (panelInflight) return panelInflight;
+  panelInflight = fetchPanelConfig(panelUrl).then((config) => {
+    panelCache = { fetchedAt: Date.now(), config };
+    return config;
+  });
+  try {
+    return await panelInflight;
+  } finally {
+    panelInflight = null;
+  }
+}
+
+/**
+ * Keep the cache warm so a player's request almost never triggers a fetch.
+ * Safe to call more than once; `unref` keeps it from holding a short-lived
+ * process (a test run, a one-off script) open.
+ */
+export function startPanelConfigPolling(): void {
+  if (panelTimer) return;
+  panelTimer = setInterval(() => {
+    void (async () => {
+      const url = await resolvePanelUrl();
+      if (!url) return;
+      panelCache = null; // force the refresh through the normal path
+      await getPanelConfig(url);
+    })().catch(() => undefined);
+  }, PANEL_POLL_MS);
+  (panelTimer as unknown as { unref?: () => void }).unref?.();
 }
 
 export async function setSetting(key: string, value: unknown): Promise<void> {
