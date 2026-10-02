@@ -96,7 +96,9 @@ export default function Mine({ active }: { active: boolean }) {
 
   const cap = profile.energyCap;
   const energyPct = Math.min(100, Math.round((energy / Math.max(1, cap)) * 100));
-  const regenSecs = profile.energyRegenSeconds;
+  // One decimal at most: the equipped regen bonus makes this a repeating
+  // fraction (3s / 1.4), and the raw value rendered as "2.142857142857143s".
+  const regenSecs = Math.round(profile.energyRegenSeconds * 10) / 10;
 
   async function runBooster(kind: "turbo" | "energy" | "recharge") {
     setPendingKind(kind);
