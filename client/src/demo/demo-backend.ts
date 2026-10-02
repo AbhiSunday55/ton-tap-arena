@@ -676,6 +676,8 @@ function adsStatus() {
   const usedToday = s.adViews.filter((v) => new Date(v.at).getTime() >= startOfDay.getTime()).length;
   return {
     enabled: cfg.adEnabled,
+    provider: cfg.adProvider,
+    blockId: cfg.adUnitId,
     unitId: cfg.adUnitId,
     link: cfg.adLink,
     rewardCoin: cfg.adRewardCoin,
@@ -950,11 +952,12 @@ function applyCode(code: string) {
   return { state: buildState() };
 }
 
-function watchAd(watchedSeconds: number) {
+function watchAd(completed: boolean, watchedSeconds: number) {
   const s = load();
   const p = sync();
   if (!cfg.adEnabled) throw new Error("Ads are currently disabled.");
-  if (watchedSeconds < cfg.adWatchSeconds) {
+  // Mirrors the server: a completed network callback OR a full simulated watch.
+  if (!completed && watchedSeconds < cfg.adWatchSeconds) {
     throw new Error(`Watch the full ${cfg.adWatchSeconds}s to earn the reward.`);
   }
   const startOfDay = new Date();
@@ -1082,7 +1085,7 @@ export function handleDemoCall(path: string, input: unknown): unknown {
     case "ads.status":
       return adsStatus();
     case "ads.watch":
-      return watchAd(Number(arg.watchedSeconds ?? 0));
+      return watchAd(Boolean(arg.completed), Number(arg.watchedSeconds ?? 0));
 
     case "withdrawal.info":
       return withdrawalInfo();

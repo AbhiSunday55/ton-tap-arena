@@ -1886,6 +1886,16 @@ table.tbl tr:hover td {
   animation: spin 0.8s linear infinite;
   margin: 0 auto;
 }
+/* Inline variant for a button that is waiting on the ad network. */
+.spinner.sm {
+  width: 13px;
+  height: 13px;
+  border-width: 2px;
+  border-top-color: currentColor;
+  margin: 0 7px 0 0;
+  display: inline-block;
+  vertical-align: -2px;
+}
 .charge-note {
   font-size: 10px;
   color: var(--muted-ink);

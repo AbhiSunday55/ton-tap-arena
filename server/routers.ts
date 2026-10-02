@@ -1615,6 +1615,10 @@ const adsRouter = router({
     const allTime = await q.countAdViewsSince(ctx.user.id, new Date(0));
     return {
       enabled: cfg.adEnabled,
+      /** `adsgram` drives the real rewarded SDK; `placeholder` is the demo slot. */
+      provider: cfg.adProvider,
+      /** The Adsgram block ID the client initialises the SDK with. */
+      blockId: cfg.adUnitId,
       unitId: cfg.adUnitId,
       link: cfg.adLink,
       rewardCoin: cfg.adRewardCoin,
@@ -1627,14 +1631,27 @@ const adsRouter = router({
   }),
 
   watch: protectedProcedure
-    .input(z.object({ watchedSeconds: z.number().min(0).max(3600) }))
+    .input(
+      z.object({
+        /**
+         * Set by the client only after the ad network reported a completed
+         * view. The server still enforces the daily cap and the watch time, so
+         * a forged `true` cannot mint coins past the limit.
+         */
+        completed: z.boolean().optional().default(false),
+        watchedSeconds: z.number().min(0).max(3600).optional().default(0),
+      }),
+    )
     .mutation(async ({ ctx, input }) => {
       const cfg = await q.getConfig();
       if (!cfg.adEnabled) {
         throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Ads are currently disabled." });
       }
-      // A zero-length impression can never earn the reward, whatever the client says.
-      if (input.watchedSeconds < cfg.adWatchSeconds) {
+      // The real network reports completion through its own callback; the
+      // simulated slot reports elapsed seconds. Either way a view that did not
+      // finish earns nothing.
+      const completed = input.completed || input.watchedSeconds >= cfg.adWatchSeconds;
+      if (!completed) {
         throw new TRPCError({
           code: "PRECONDITION_FAILED",
           message: `Watch the full ${cfg.adWatchSeconds}s to earn the reward.`,

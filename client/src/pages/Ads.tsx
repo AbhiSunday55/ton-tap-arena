@@ -1,78 +1,35 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { trpc } from "../_core/trpc";
-import { useGame } from "../lib/store";
-import { useAudio } from "../lib/audio";
 import { fmtShort, fmtInt } from "../lib/format";
 import { AD_CHEST_IMG } from "../lib/assets";
+import { useAdReward } from "../lib/useAdReward";
+import { isTelegramMiniApp } from "../lib/adsgram";
 
 /**
- * Watch-an-ad screen. The slot is driven entirely by server config — network,
- * unit ID, destination link, reward and daily cap — so connecting an ad network
- * later is a configuration change with no redeploy.
+ * Watch-an-ad screen.
  *
- * The reward is server-authoritative: `ads.watch` rejects anything shorter than
- * the configured watch time and enforces the daily cap, so a client cannot mint
- * coins by calling the endpoint directly.
+ * The slot is driven entirely by server config — network, block ID, reward and
+ * daily cap — so switching networks is a configuration change with no redeploy.
+ *
+ * The reward is server-authoritative: `ads.watch` enforces the daily cap and
+ * refuses a view that did not complete, so a client cannot mint coins by calling
+ * the endpoint directly.
+ *
+ * ── Why this screen now explains itself ──────────────────────────────────────
+ * Adsgram picks a creative from the Telegram user context, so a rewarded ad can
+ * only play inside a real Mini App launch. Previously a tap outside Telegram did
+ * nothing at all, which is indistinguishable from a broken button. The screen
+ * now states the requirement up front, shows a loading state while the ad is
+ * requested, and surfaces every failure as visible text.
  */
 export default function Ads({ active }: { active: boolean }) {
-  const { applyState, toast } = useGame();
-  const { sfx } = useAudio();
-  const statusQ = trpc.ads.status.useQuery(undefined, { enabled: active });
-  const watchM = trpc.ads.watch.useMutation();
+  const ad = useAdReward(active);
+  const s = ad.status;
 
-  const [secondsLeft, setSecondsLeft] = useState<number | null>(null);
-  const [busy, setBusy] = useState(false);
-  const timerRef = useRef<number | null>(null);
-  const elapsedRef = useRef(0);
+  // The SDK script is present in every browser, so `window.Telegram` alone is
+  // not proof of a Mini App — `initData` is.
+  const inTelegram = isTelegramMiniApp();
+  const needsTelegram = s?.provider === "adsgram" && !inTelegram;
 
-  // countdown driven off a ref so a re-render cannot restart it mid-view
-  useEffect(() => {
-    if (secondsLeft === null) return;
-    if (secondsLeft <= 0) return;
-    timerRef.current = window.setTimeout(() => {
-      elapsedRef.current += 1;
-      setSecondsLeft((s) => (s === null ? null : s - 1));
-    }, 1000);
-    return () => {
-      if (timerRef.current !== null) window.clearTimeout(timerRef.current);
-    };
-  }, [secondsLeft]);
-
-  const finish = useCallback(
-    async (watched: number) => {
-      setBusy(true);
-      try {
-        const res = await watchM.mutateAsync({ watchedSeconds: watched });
-        applyState(res.state);
-        sfx("coin");
-        toast(`Ad reward: +${fmtInt(res.rewardCoin)} COIN`, "ok");
-      } catch (e) {
-        sfx("error");
-        toast(e instanceof Error ? e.message : "Ad reward failed", "err");
-      } finally {
-        setSecondsLeft(null);
-        elapsedRef.current = 0;
-        setBusy(false);
-        void statusQ.refetch();
-      }
-    },
-    [watchM, applyState, sfx, toast, statusQ],
-  );
-
-  // The countdown hitting zero is what earns the reward — never the click.
-  useEffect(() => {
-    if (secondsLeft !== 0) return;
-    void finish(elapsedRef.current);
-  }, [secondsLeft, finish]);
-
-  const start = useCallback(() => {
-    const dur = statusQ.data?.watchSeconds ?? 15;
-    elapsedRef.current = 0;
-    setSecondsLeft(dur);
-    sfx("turbo");
-  }, [statusQ.data, sfx]);
-
-  if (!statusQ.data) {
+  if (!s) {
     return (
       <section className={`screen ads ${active ? "active" : ""}`} aria-hidden={!active}>
         <div className="empty">
@@ -83,14 +40,24 @@ export default function Ads({ active }: { active: boolean }) {
     );
   }
 
-  const s = statusQ.data;
   const exhausted = s.remaining <= 0;
+  const disabled = ad.playing || exhausted || !s.enabled;
+
+  const label = !s.enabled
+    ? "Ads disabled"
+    : exhausted
+      ? "Come back tomorrow"
+      : ad.playing
+        ? "Loading ad…"
+        : ad.countdown !== null
+          ? `Watching… ${ad.countdown}s`
+          : `▶ Watch ad · +${fmtInt(s.rewardCoin)}`;
 
   return (
     <section className={`screen ads ${active ? "active" : ""}`} aria-hidden={!active}>
       <div className="sec-title" style={{ marginTop: 12 }}>
         <h2>
-          <span className="dot" /> Watch & earn
+          <span className="dot" /> Watch &amp; earn
         </h2>
         <span className="hint">
           {s.usedToday}/{s.dailyLimit} today
@@ -106,29 +73,36 @@ export default function Ads({ active }: { active: boolean }) {
         <div className="s">
           {exhausted
             ? `You have used all ${s.dailyLimit} views. The counter resets at midnight UTC.`
-            : `Watch a ${s.watchSeconds}-second ad to collect the reward. ${s.remaining} view${s.remaining === 1 ? "" : "s"} remaining today.`}
+            : `Watch a short ad to collect the reward. ${s.remaining} view${s.remaining === 1 ? "" : "s"} remaining today.`}
         </div>
 
-        {secondsLeft !== null && (
-          <div className="ad-timer">
-            {secondsLeft > 0 ? secondsLeft : "✓"}
-          </div>
+        {ad.countdown !== null && (
+          <div className="ad-timer">{ad.countdown > 0 ? ad.countdown : "✓"}</div>
         )}
       </div>
 
+      {/* The honest explanation, shown before the player taps rather than after. */}
+      {needsTelegram && (
+        <div className="warn-box warn" style={{ marginTop: 12 }}>
+          <b>Ads play inside Telegram only</b>
+          Rewarded ads are served by Adsgram, which needs your Telegram session to pick a
+          creative. Open the game from the bot's menu button in Telegram and the ad will play
+          here. Everything else in the game works normally in a browser.
+        </div>
+      )}
+
+      {/* A visible failure, never a silent no-op. */}
+      {ad.error && (
+        <div className="warn-box bad" style={{ marginTop: 12 }} role="alert">
+          <b>Ad not played</b>
+          {ad.error}
+        </div>
+      )}
+
       <div className="row" style={{ marginTop: 12 }}>
-        <button
-          className="btn btn-cyan"
-          onClick={start}
-          disabled={busy || exhausted || secondsLeft !== null || !s.enabled}
-        >
-          {!s.enabled
-            ? "Ads disabled"
-            : exhausted
-              ? "Come back tomorrow"
-              : secondsLeft !== null
-                ? `Watching… ${secondsLeft}s`
-                : `▶ Watch ad · +${fmtInt(s.rewardCoin)}`}
+        <button className="btn btn-cyan" onClick={ad.play} disabled={disabled}>
+          {ad.playing && <span className="spinner sm" aria-hidden />}
+          {label}
         </button>
       </div>
 
@@ -143,25 +117,19 @@ export default function Ads({ active }: { active: boolean }) {
 
       <div className="card">
         <div className="list-row">
-          <div className="em">🆔</div>
+          <div className="em">📡</div>
           <div className="mid">
-            <div className="t mono">{s.unitId || "not set"}</div>
-            <div className="s">Ad unit ID</div>
+            <div className="t">
+              {s.provider === "adsgram" ? "Adsgram (rewarded)" : "Simulated slot"}
+            </div>
+            <div className="s">Ad network</div>
           </div>
         </div>
         <div className="list-row">
-          <div className="em">🔗</div>
+          <div className="em">🆔</div>
           <div className="mid">
-            <div className="t">
-              {s.link ? (
-                <a href={s.link} target="_blank" rel="noreferrer noopener">
-                  {s.link.length > 42 ? `${s.link.slice(0, 42)}…` : s.link}
-                </a>
-              ) : (
-                "not set"
-              )}
-            </div>
-            <div className="s">Where the ad sends the player</div>
+            <div className="t mono">{s.blockId || "not set"}</div>
+            <div className="s">Ad block ID</div>
           </div>
         </div>
         <div className="list-row">
@@ -169,15 +137,6 @@ export default function Ads({ active }: { active: boolean }) {
           <div className="mid">
             <div className="t">{fmtInt(s.rewardCoin)} COIN per view</div>
             <div className="s">Reward per completed view</div>
-          </div>
-        </div>
-        <div className="list-row">
-          <div className="em">⏱️</div>
-          <div className="mid">
-            <div className="t">{s.watchSeconds}s minimum watch</div>
-            <div className="s">
-              Enforced by the server — a shorter view is rejected outright
-            </div>
           </div>
         </div>
         <div className="list-row">

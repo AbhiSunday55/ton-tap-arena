@@ -3,7 +3,8 @@ import { trpc } from "../_core/trpc";
 import { useGame } from "../lib/store";
 import { useAudio } from "../lib/audio";
 import { fmtCoin, fmtInt, fmtShort, untilLabel } from "../lib/format";
-import { skinImage, buttonImage } from "../lib/assets";
+import { skinImage, buttonImage, AD_CHEST_IMG } from "../lib/assets";
+import { useAdReward } from "../lib/useAdReward";
 import { effectLines } from "../../../shared/item-effects";
 
 interface Fx {
@@ -23,6 +24,8 @@ interface Fx {
 export default function Mine({ active }: { active: boolean }) {
   const { state, coin, energy, tap, perTap, applyState, toast, refetch } = useGame();
   const { sfx } = useAudio();
+  // The same ad flow the Ads screen uses, so the two entry points cannot drift.
+  const ad = useAdReward(active);
 
   const stageRef = useRef<HTMLDivElement>(null);
   const [fx, setFx] = useState<Fx[]>([]);
@@ -294,6 +297,40 @@ export default function Mine({ active }: { active: boolean }) {
           </div>
         );
       })()}
+
+      {/* The ad chest: a second, always-visible way into the rewarded slot. */}
+      {ad.status && (
+        <div className="card tight" style={{ marginTop: 10 }}>
+          <div className="list-row" style={{ borderBottom: "none" }}>
+            <img
+              src={AD_CHEST_IMG}
+              alt=""
+              style={{ width: 46, height: 46, borderRadius: 12, objectFit: "cover", flex: "0 0 auto" }}
+            />
+            <div className="mid">
+              <div className="t">
+                {ad.status.remaining > 0
+                  ? `Watch an ad \u00b7 +${fmtInt(ad.status.rewardCoin)} COIN`
+                  : "No ad views left today"}
+              </div>
+              <div className="s">
+                {ad.error
+                  ? ad.error
+                  : ad.status.remaining > 0
+                    ? `${ad.status.remaining} of ${ad.status.dailyLimit} views left today`
+                    : "The counter resets at midnight UTC"}
+              </div>
+            </div>
+            <button
+              className="btn btn-cyan xs"
+              onClick={ad.play}
+              disabled={ad.playing || ad.status.remaining <= 0 || !ad.status.enabled}
+            >
+              {ad.playing ? "\u2026" : ad.countdown !== null ? `${ad.countdown}s` : "Watch"}
+            </button>
+          </div>
+        </div>
+      )}
 
       <div className="sec-title">
         <h2>
