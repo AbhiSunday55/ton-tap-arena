@@ -35,8 +35,45 @@ export type LedgerRow = typeof ledger.$inferSelect;
 export async function getConfigOverrides(): Promise<Record<string, unknown>> {
   const rows = await db.select().from(settings);
   const out: Record<string, unknown> = {};
-  for (const r of rows) out[r.key] = r.value;
+  for (const r of rows) {
+    // Secrets live in the same table but must NEVER be serialised to the client
+    // — `getConfig()` feeds the game state every player receives.
+    if (SECRET_SETTING_KEYS.has(r.key)) continue;
+    out[r.key] = r.value;
+  }
   return out;
+}
+
+/**
+ * Setting keys that are server-side secrets. Stored in `settings` so an operator
+ * can rotate them from the admin panel, but filtered out of every client-facing
+ * config read.
+ */
+export const SECRET_SETTING_KEYS = new Set(["telegramBotToken", "telegramClientSecret"]);
+
+/** Read a secret setting, or undefined when it has never been set. */
+export async function getSecretSetting(key: string): Promise<string | undefined> {
+  const [row] = await db.select().from(settings).where(eq(settings.key, key)).limit(1);
+  const v = row?.value;
+  return typeof v === "string" && v.length > 0 ? v : undefined;
+}
+
+/**
+ * The bot token used to verify Telegram `initData`. An admin-panel override wins
+ * over the environment variable, so the token can be rotated without a redeploy
+ * — but it is read ONLY here, server-side, and never enters `GameConfig`.
+ *
+ * `env` is imported DYNAMICALLY on purpose. `env.ts` throws at module load when
+ * DATABASE_URL is absent, and this module is imported by the frozen
+ * `test-caller.test.ts` (which mocks the env-reading leaves but deliberately
+ * leaves `../db` real). A static import here would make that test fail to load
+ * — a unit test must not need a database to import the router.
+ */
+export async function resolveTelegramBotToken(): Promise<string> {
+  const override = await getSecretSetting("telegramBotToken");
+  if (override) return override;
+  const { env } = await import("./_core/env");
+  return env.telegram.botToken;
 }
 
 export async function getConfig(): Promise<GameConfig> {

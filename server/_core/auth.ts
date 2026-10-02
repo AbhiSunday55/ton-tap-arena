@@ -1,11 +1,17 @@
 import type { Context } from "hono";
 import { getCookie, setCookie, deleteCookie } from "hono/cookie";
+import { randomUUID } from "node:crypto";
 import { SignJWT, jwtVerify } from "jose";
 import { compare, hash as bcryptHash } from "bcryptjs";
 import { eq } from "drizzle-orm";
+import {
+  telegramHandle,
+  telegramPlaceholderEmail,
+  type TelegramUser,
+} from "./telegram";
 import { db } from "./db";
 import { isUniqueViolation } from "./db-errors";
-import { users } from "../../drizzle/schema";
+import { users, telegramAccounts } from "../../drizzle/schema";
 import { env } from "./env";
 import { sessionCookieName, type UserRole } from "../../shared/constants";
 import type { SessionUser } from "../../shared/types";
@@ -33,9 +39,21 @@ export interface AuthProvider {
 const COOKIE = sessionCookieName(env.appSlug);
 const secretKey = new TextEncoder().encode(env.jwtSecret);
 
-function toSessionUser(row: typeof users.$inferSelect): SessionUser {
+function toSessionUser(
+  row: typeof users.$inferSelect,
+  tg?: typeof telegramAccounts.$inferSelect | null,
+): SessionUser {
   // password_hash is intentionally dropped here — never leaves the auth layer.
-  return { id: row.id, email: row.email, name: row.name, role: row.role as UserRole };
+  return {
+    id: row.id,
+    email: row.email,
+    name: row.name,
+    role: row.role as UserRole,
+    authMethod: (row.authMethod as SessionUser["authMethod"]) ?? "password",
+    telegramId: tg?.telegramId ?? null,
+    telegramUsername: tg?.username ?? null,
+    telegramPhotoUrl: tg?.photoUrl ?? null,
+  };
 }
 
 class LocalAuthProvider implements AuthProvider {
@@ -46,8 +64,14 @@ class LocalAuthProvider implements AuthProvider {
       const { payload } = await jwtVerify(token, secretKey);
       const userId = payload.sub;
       if (!userId) return null;
-      const [row] = await db.select().from(users).where(eq(users.id, userId)).limit(1);
-      return row ? toSessionUser(row) : null;
+      // One query: the credential row plus its Telegram identity, if linked.
+      const [row] = await db
+        .select({ user: users, tg: telegramAccounts })
+        .from(users)
+        .leftJoin(telegramAccounts, eq(telegramAccounts.userId, users.id))
+        .where(eq(users.id, userId))
+        .limit(1);
+      return row ? toSessionUser(row.user, row.tg) : null;
     } catch {
       return null; // expired / tampered / wrong key → treat as anonymous
     }
@@ -141,4 +165,98 @@ export async function registerLocalUser(email: string, password: string, name?: 
     }
     throw e;
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Telegram Mini App identity
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Resolve a VALIDATED Telegram user to a local account, creating it on first
+ * sight. The caller must have already verified `initData` — this function
+ * trusts its input completely, so it is never reachable from a raw request.
+ *
+ * Upsert is keyed on `telegramId` (unique index), so a returning player always
+ * lands on the same row no matter which device or session they arrive from.
+ * The placeholder email keeps the scaffold's NOT NULL `users.email` intact
+ * without inventing a real address for someone who never gave one.
+ */
+export async function upsertTelegramUser(tg: TelegramUser): Promise<SessionUser> {
+  const email = telegramPlaceholderEmail(tg.id);
+  const name = telegramHandle(tg);
+
+  // Already linked? Refresh the identity Telegram may have changed and return.
+  const [linked] = await db
+    .select({ user: users, tg: telegramAccounts })
+    .from(telegramAccounts)
+    .innerJoin(users, eq(users.id, telegramAccounts.userId))
+    .where(eq(telegramAccounts.telegramId, tg.id))
+    .limit(1);
+
+  if (linked) {
+    const [updatedTg] = await db
+      .update(telegramAccounts)
+      .set({
+        username: tg.username ?? null,
+        firstName: tg.firstName || null,
+        lastName: tg.lastName ?? null,
+        languageCode: tg.languageCode ?? null,
+        isPremium: tg.isPremium ?? false,
+        photoUrl: tg.photoUrl ?? null,
+        lastSeenAt: new Date(),
+      })
+      .where(eq(telegramAccounts.telegramId, tg.id))
+      .returning();
+    const [updatedUser] = await db
+      .update(users)
+      .set({ name })
+      .where(eq(users.id, linked.user.id))
+      .returning();
+    return toSessionUser(updatedUser ?? linked.user, updatedTg ?? linked.tg);
+  }
+
+  // First sight: create the credential row, then link the Telegram identity.
+  // `users.email` is NOT NULL, so a Telegram player gets a deterministic
+  // placeholder — stable, unique, and never a real address they did not give.
+  const [user] = await db
+    .insert(users)
+    .values({ email, passwordHash: null, name, authMethod: "telegram" })
+    .returning();
+
+  const [account] = await db
+    .insert(telegramAccounts)
+    .values({
+      userId: user.id,
+      telegramId: tg.id,
+      username: tg.username ?? null,
+      firstName: tg.firstName || null,
+      lastName: tg.lastName ?? null,
+      languageCode: tg.languageCode ?? null,
+      isPremium: tg.isPremium ?? false,
+      photoUrl: tg.photoUrl ?? null,
+      authDate: new Date(),
+      lastSeenAt: new Date(),
+    })
+    .returning();
+
+  return toSessionUser(user, account);
+}
+
+/**
+ * Create a throwaway guest account for a browser visitor outside Telegram.
+ * No password is set, so the account is only reachable through the session
+ * cookie issued here — there is nothing to guess or brute-force.
+ */
+export async function registerGuestUser(): Promise<SessionUser> {
+  const suffix = randomUUID().replace(/-/g, "").slice(0, 12);
+  const [row] = await db
+    .insert(users)
+    .values({
+      email: `guest_${suffix}@guest.local`,
+      passwordHash: null,
+      name: `Guest ${suffix.slice(0, 4).toUpperCase()}`,
+      authMethod: "guest",
+    })
+    .returning();
+  return toSessionUser(row);
 }

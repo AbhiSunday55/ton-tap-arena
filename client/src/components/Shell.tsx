@@ -1,14 +1,21 @@
-import { useEffect, useState } from "react";
+import { Suspense, lazy, useEffect, useState } from "react";
 import { useGame } from "../lib/store";
 import { useAudio } from "../lib/audio";
 import { fmtShort, nanoToTon, fmtTon } from "../lib/format";
 import { skinImage } from "../lib/assets";
-import Mine from "../pages/Mine";
-import Wallet from "../pages/Wallet";
-import Referral from "../pages/Referral";
-import Shop from "../pages/Shop";
-import Leaderboard from "../pages/Leaderboard";
-import Ads from "../pages/Ads";
+
+/**
+ * Screens are code-split. The login screen is the first thing anyone sees, and
+ * it needs none of them — so they load after sign-in, in parallel with the
+ * first game state, and are preloaded during idle time so switching tabs is
+ * still instant.
+ */
+const Mine = lazy(() => import("../pages/Mine"));
+const Wallet = lazy(() => import("../pages/Wallet"));
+const Referral = lazy(() => import("../pages/Referral"));
+const Shop = lazy(() => import("../pages/Shop"));
+const Leaderboard = lazy(() => import("../pages/Leaderboard"));
+const Ads = lazy(() => import("../pages/Ads"));
 
 type TabKey = "mine" | "wallet" | "board" | "referral" | "shop" | "ads";
 
@@ -21,29 +28,45 @@ const TABS: { key: TabKey; icon: string; label: string; screen: string }[] = [
   { key: "ads", icon: "🎬", label: "Ads", screen: "ads" },
 ];
 
-/** Telegram Mini App chrome — no-op in a normal browser. */
-function useTelegramChrome() {
+/** Warm every screen chunk once the browser is idle, so tab switches never wait. */
+function usePreloadScreens() {
   useEffect(() => {
-    const wa = (
-      window as unknown as {
-        Telegram?: { WebApp?: { ready?: () => void; expand?: () => void; setHeaderColor?: (c: string) => void } };
-      }
-    ).Telegram?.WebApp;
-    try {
-      wa?.ready?.();
-      wa?.expand?.();
-      wa?.setHeaderColor?.("#070b16");
-    } catch {
-      /* not inside Telegram */
+    const warm = () => {
+      void import("../pages/Mine");
+      void import("../pages/Wallet");
+      void import("../pages/Referral");
+      void import("../pages/Shop");
+      void import("../pages/Leaderboard");
+      void import("../pages/Ads");
+    };
+    const ric = (window as unknown as { requestIdleCallback?: (cb: () => void) => number })
+      .requestIdleCallback;
+    if (ric) {
+      const id = ric(warm);
+      return () => {
+        const cic = (window as unknown as { cancelIdleCallback?: (id: number) => void })
+          .cancelIdleCallback;
+        cic?.(id);
+      };
     }
+    const t = window.setTimeout(warm, 1200);
+    return () => window.clearTimeout(t);
   }, []);
+}
+
+function ScreenFallback() {
+  return (
+    <div className="center-fill">
+      <div className="spinner" />
+    </div>
+  );
 }
 
 export default function Shell() {
   const { state, coin, loading, error, refetch } = useGame();
   const { muted, toggleMute } = useAudio();
   const [tab, setTab] = useState<TabKey>("mine");
-  useTelegramChrome();
+  usePreloadScreens();
 
   if (loading) {
     return (
@@ -124,12 +147,14 @@ export default function Shell() {
       {cfg.announcementBanner && <div className="announce">📣 {cfg.announcementBanner}</div>}
 
       <div className="screens">
-        <Mine active={tab === "mine"} />
-        <Wallet active={tab === "wallet"} tonBalance={tonBalance} />
-        <Leaderboard active={tab === "board"} />
-        <Referral active={tab === "referral"} />
-        <Shop active={tab === "shop"} />
-        <Ads active={tab === "ads"} />
+        <Suspense fallback={<ScreenFallback />}>
+          <Mine active={tab === "mine"} />
+          <Wallet active={tab === "wallet"} tonBalance={tonBalance} />
+          <Leaderboard active={tab === "board"} />
+          <Referral active={tab === "referral"} />
+          <Shop active={tab === "shop"} />
+          <Ads active={tab === "ads"} />
+        </Suspense>
       </div>
 
       <nav className="tabbar">

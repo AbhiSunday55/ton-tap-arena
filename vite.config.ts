@@ -17,7 +17,9 @@ const API_PORT = Number(process.env.API_PORT ?? 3001);
 const apiProxy = { target: `http://localhost:${API_PORT}`, changeOrigin: true };
 
 export default defineConfig({
-  base: "/",
+  // `VITE_BASE` lets the GitHub Pages build mount the app under a repo subpath
+  // (`/ton-tap-arena/`) while the platform build keeps serving from the root.
+  base: process.env.VITE_BASE ?? "/",
   // Tailwind v4 runs as a Vite plugin (no tailwind.config / postcss / autoprefixer);
   // it auto-detects content, theme tokens live in client/src/index.css (@theme).
   plugins: [react(), tailwindcss()],

@@ -8,7 +8,8 @@ import { TRPCError } from "@trpc/server";
 import { getCookie, setCookie, deleteCookie } from "hono/cookie";
 import * as bcrypt from "bcryptjs";
 import { router, publicProcedure, protectedProcedure, middleware } from "./_core/trpc";
-import { authProvider, registerLocalUser, AuthError, EmailTakenError } from "./_core/auth";
+import { authProvider, registerLocalUser, AuthError, EmailTakenError, upsertTelegramUser, registerGuestUser, issueSessionCookie } from "./_core/auth";
+import { validateInitData } from "./_core/telegram";
 import * as q from "./db";
 import { seedCatalogue } from "./services/seed";
 import { filesRouter } from "./demo-routers";
@@ -513,6 +514,43 @@ const authRouter = router({
   logout: publicProcedure.mutation(async ({ ctx }) => {
     await authProvider().logout(ctx.c);
     return { ok: true };
+  }),
+
+  /**
+   * Telegram Mini App sign-in. The client sends the raw `initData` string
+   * Telegram handed it; the server verifies the HMAC against the bot token
+   * before trusting a single field of it. A tampered payload fails the
+   * signature check and is rejected — the client cannot assert an identity.
+   *
+   * On success the player is upserted into the real user database and given the
+   * same session cookie the password flow issues, so every downstream procedure
+   * is unchanged.
+   */
+  telegram: publicProcedure
+    .input(z.object({ initData: z.string().min(1) }))
+    .mutation(async ({ ctx, input }) => {
+      const botToken = await q.resolveTelegramBotToken();
+      const result = validateInitData(input.initData, botToken);
+      if (!result.ok) {
+        throw new TRPCError({
+          code: "UNAUTHORIZED",
+          message: `Telegram sign-in failed (${result.reason}).`,
+        });
+      }
+      const user = await upsertTelegramUser(result.user);
+      await issueSessionCookie(ctx.c, user.id);
+      return user;
+    }),
+
+  /**
+   * Guest sign-in for a browser outside Telegram (GitHub Pages, a desktop
+   * browser). Creates a throwaway account with no password, so the only way in
+   * is the session cookie minted here.
+   */
+  guest: publicProcedure.mutation(async ({ ctx }) => {
+    const user = await registerGuestUser();
+    await issueSessionCookie(ctx.c, user.id);
+    return user;
   }),
 });
 

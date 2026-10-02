@@ -23,6 +23,13 @@ export const users = pgTable("users", {
   name: text("name"),
   role: text("role").notNull().default("user"), // 'user' | 'admin'
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  /**
+   * How this account authenticates: 'password' | 'telegram' | 'guest'.
+   * ADDITIVE — the scaffold's auth columns above are untouched. Telegram
+   * identity itself lives in `telegram_accounts` (one row per linked account),
+   * so this table stays the single credential record for every method.
+   */
+  authMethod: text("auth_method").notNull().default("password"),
 });
 
 export const files = pgTable(

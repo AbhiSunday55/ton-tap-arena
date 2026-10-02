@@ -1,0 +1,69 @@
+name: Deploy to GitHub Pages
+
+# Builds the client as a STANDALONE demo and publishes it to GitHub Pages.
+#
+# GitHub Pages serves static files only — there is no Node process, no Postgres
+# and no bot token — so this build sets VITE_DEMO=1, which swaps the tRPC
+# network link for the in-browser demo backend (client/src/demo/demo-backend.ts).
+# The result is a fully playable game with no server behind it.
+#
+# The real Telegram Mini App is the platform build, which talks to the actual
+# API and verifies initData server-side. This workflow does not replace it.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Build the standalone demo
+        env:
+          VITE_DEMO: "1"
+          VITE_BASE: /ton-tap-arena/
+        run: pnpm build:web
+
+      - name: Add a 404 fallback
+        # Pages has no SPA rewrite, so a deep link would 404. Serving index.html
+        # as the 404 page keeps client-side routing working.
+        run: cp dist/public/index.html dist/public/404.html
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist/public
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

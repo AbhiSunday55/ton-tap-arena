@@ -9,6 +9,7 @@ import {
   type ReactNode,
 } from "react";
 import { trpc } from "../_core/trpc";
+import { useAuth } from "../_core/useAuth";
 import { useAudio } from "./audio";
 import type { GameState } from "./api-types";
 
@@ -57,6 +58,7 @@ const QUEUE_CAP = MAX_BATCH * 2;
 
 export function GameProvider({ children }: { children: ReactNode }) {
   const { sfx } = useAudio();
+  const { user } = useAuth();
 
   const [toasts, setToasts] = useState<Toast[]>([]);
   const toast = useCallback((msg: string, kind: ToastKind = "info") => {
@@ -65,7 +67,13 @@ export function GameProvider({ children }: { children: ReactNode }) {
     setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 3600);
   }, []);
 
-  const query = trpc.game.state.useQuery(undefined, { retry: 1, refetchOnWindowFocus: true });
+  // Gated on the session: firing this while signed out would 401 on every load
+  // and, worse, make the login screen wait on a request that cannot succeed.
+  const query = trpc.game.state.useQuery(undefined, {
+    retry: 1,
+    refetchOnWindowFocus: true,
+    enabled: Boolean(user),
+  });
   const bootstrapM = trpc.game.bootstrap.useMutation();
 
   const [state, setState] = useState<GameState | null>(null);
@@ -74,6 +82,7 @@ export function GameProvider({ children }: { children: ReactNode }) {
   // Populate the catalogue and the sample leaderboard once per session. The
   // server memoises it, so this is cheap on every later page load.
   useEffect(() => {
+    if (!user) return;
     if (bootedRef.current) return;
     bootedRef.current = true;
     bootstrapM.mutateAsync().catch(() => {
@@ -81,7 +90,7 @@ export function GameProvider({ children }: { children: ReactNode }) {
       // renders the arena, and the next load retries the seed.
       bootedRef.current = false;
     });
-  }, [bootstrapM]);
+  }, [bootstrapM, user]);
 
   useEffect(() => {
     if (query.data) setState(query.data);

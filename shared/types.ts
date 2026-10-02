@@ -9,4 +9,10 @@ export interface SessionUser {
   email: string;
   name: string | null;
   role: UserRole;
+  /** How this account authenticates: 'password' | 'telegram' | 'guest'. */
+  authMethod?: "password" | "telegram" | "guest";
+  /** Present for Telegram Mini App accounts. */
+  telegramId?: string | null;
+  telegramUsername?: string | null;
+  telegramPhotoUrl?: string | null;
 }

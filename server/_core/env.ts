@@ -36,4 +36,15 @@ export const env = {
     presignUrl: process.env.APP_STORAGE_PRESIGN_URL ?? "",
     token: process.env.APP_STORAGE_TOKEN ?? "",
   },
+  // ── Telegram Mini App ──
+  // SERVER-SIDE ONLY. The bot token is the HMAC key that proves an `initData`
+  // payload really came from Telegram, so it must never reach the browser: it is
+  // read here, never placed in `GameConfig` (which IS serialised to the client),
+  // and never logged. An admin-panel override can be stored in `settings` under
+  // a key that `getConfigOverrides()` filters out (see SECRET_SETTING_KEYS).
+  telegram: {
+    botToken: process.env.TELEGRAM_BOT_TOKEN ?? "",
+    clientId: process.env.TELEGRAM_CLIENT_ID ?? "",
+    clientSecret: process.env.TELEGRAM_CLIENT_SECRET ?? "",
+  },
 };

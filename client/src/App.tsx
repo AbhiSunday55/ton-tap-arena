@@ -1,33 +1,17 @@
-import { useEffect } from "react";
+import { Suspense, lazy, useEffect } from "react";
 import { useAuth } from "./_core/useAuth";
 import { useGame } from "./lib/store";
 import { useAudio } from "./lib/audio";
+import { applyTelegramChrome } from "./_core/telegram-webapp";
 import Shell from "./components/Shell";
 import Auth from "./pages/Auth";
 
-/** Telegram Mini App bootstrap: expand to full height and adopt its chrome. */
-function useTelegramChrome() {
-  useEffect(() => {
-    const tg = (window as unknown as { Telegram?: { WebApp?: Record<string, unknown> } }).Telegram
-      ?.WebApp as
-      | {
-          ready?: () => void;
-          expand?: () => void;
-          setHeaderColor?: (c: string) => void;
-          setBackgroundColor?: (c: string) => void;
-        }
-      | undefined;
-    if (!tg) return;
-    try {
-      tg.ready?.();
-      tg.expand?.();
-      tg.setHeaderColor?.("#070b18");
-      tg.setBackgroundColor?.("#070b18");
-    } catch {
-      /* not inside Telegram — the plain browser is a first-class target too */
-    }
-  }, []);
-}
+/**
+ * The TON Connect SDK is ~200 KB and the login screen never touches it, so it is
+ * split into its own chunk and mounted only once a player is signed in. The
+ * wallet chunk then downloads in parallel with the first game state.
+ */
+const TonConnectBoundary = lazy(() => import("./_core/TonConnectBoundary"));
 
 /**
  * Route shell — the game, and only the game.
@@ -35,12 +19,22 @@ function useTelegramChrome() {
  * This build ships the player-facing app alone. Management tooling is a
  * separate, unreleased surface with no route, link or reference here, so there
  * is nothing in the shipped product for a player to find, click or guess at.
+ *
+ * ── First paint ────────────────────────────────────────────────────────────
+ * There is deliberately NO blocking gate here. `useAuth()` resolves the session
+ * synchronously from cache, so this component decides between the login screen
+ * and the game on its very first render — no spinner, no round trip. The server
+ * check runs in the background and corrects the cache when it answers.
  */
 export default function App() {
-  useTelegramChrome();
-  const { user, isLoading } = useAuth();
+  const { user } = useAuth();
   const { state, toasts } = useGame();
   const { unlock } = useAudio();
+
+  // Adopt Telegram's chrome (full height, matching header) as early as possible.
+  useEffect(() => {
+    applyTelegramChrome();
+  }, []);
 
   // The first real user gesture is what unlocks WebAudio in every browser.
   useEffect(() => {
@@ -70,16 +64,10 @@ export default function App() {
     </div>
   );
 
-  if (isLoading) {
-    return (
-      <div className="center-fill">
-        <div className="spinner" />
-      </div>
-    );
-  }
-
+  // No session → the front door, painted immediately.
   if (!user) return <Auth />;
 
+  // Signed in, game state still arriving. Brief, and only ever after auth.
   if (!state) {
     return (
       <div className="center-fill">
@@ -90,9 +78,18 @@ export default function App() {
   }
 
   return (
-    <>
-      <Shell />
-      {toastLayer}
-    </>
+    <Suspense
+      fallback={
+        <div className="center-fill">
+          <div className="spinner" />
+          <div className="loading-note">Waking the arena…</div>
+        </div>
+      }
+    >
+      <TonConnectBoundary>
+        <Shell />
+        {toastLayer}
+      </TonConnectBoundary>
+    </Suspense>
   );
 }

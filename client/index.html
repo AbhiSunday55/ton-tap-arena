@@ -2,11 +2,66 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>App</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    <meta name="theme-color" content="#070b18" />
+    <title>TON Tap Arena</title>
+    <!--
+      Telegram Mini App SDK. `defer` keeps it off the critical path while still
+      guaranteeing it executes before the app module (both are deferred, and
+      deferred scripts run in document order) — so `window.Telegram.WebApp` is
+      ready by the time the app reads `initData`.
+    -->
+    <script src="https://telegram.org/js/telegram-web-app.js" defer></script>
+    <style>
+      /*
+        Pre-paint splash. Inline and dependency-free so the very first frame is
+        the game's own dark background rather than a white flash — the login
+        screen must feel instant, and a white flash is the opposite of that.
+        React replaces #root's contents on mount.
+      */
+      html,
+      body {
+        margin: 0;
+        background: #070b18;
+        color: #e8edf7;
+        font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      }
+      #boot {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        flex-direction: column;
+        gap: 14px;
+      }
+      #boot .ring {
+        width: 34px;
+        height: 34px;
+        border-radius: 50%;
+        border: 3px solid rgba(255, 255, 255, 0.14);
+        border-top-color: #f5c451;
+        animation: bootspin 0.8s linear infinite;
+      }
+      #boot .lbl {
+        font-size: 13px;
+        letter-spacing: 0.04em;
+        color: #8b97b0;
+      }
+      @keyframes bootspin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+    </style>
   </head>
   <body>
-    <div id="root"></div>
+    <div id="root">
+      <div id="boot">
+        <div class="ring"></div>
+        <div class="lbl">TON TAP ARENA</div>
+      </div>
+    </div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
