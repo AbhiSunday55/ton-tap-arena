@@ -37,7 +37,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: pnpm
+        # No `cache: pnpm` on purpose: the cache step shells out to `pnpm store
+        # path` and fails the job when it cannot resolve the store. Installing
+        # without the cache is a few seconds slower and always works.
 
       - name: Install dependencies
         run: pnpm install --no-frozen-lockfile
