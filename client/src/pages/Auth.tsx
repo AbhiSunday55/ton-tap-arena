@@ -1,5 +1,6 @@
 import { useState, type FormEvent } from "react";
 import { useAuth } from "../_core/useAuth";
+import { asset } from "../lib/assets";
 
 /**
  * The front door.
@@ -49,7 +50,7 @@ export default function AuthPage() {
       <div className="screen active mine" style={{ paddingBottom: 28 }}>
         <div className="auth-box" style={{ margin: "28px auto 0" }}>
           <div className="brand">
-            <img className="mk" src="/assets/coin.png" alt="" />
+            <img className="mk" src={asset("assets/coin.png")} alt="" />
             <h1>TON Tap Arena</h1>
             <p>Tap to mine. Stack COIN. Cash out in TON.</p>
           </div>

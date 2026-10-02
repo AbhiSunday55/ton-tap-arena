@@ -8,6 +8,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
+import { asset } from "./assets";
 
 export type SfxName =
   | "tap"
@@ -33,7 +34,8 @@ export interface AudioApi {
 
 const Ctx = createContext<AudioApi | null>(null);
 const STORAGE_KEY = "tta.muted";
-const BGM_SRC = "/assets/tap_arena_theme.mp3";
+
+const BGM_SRC = asset("assets/tap_arena_theme.mp3");
 
 /**
  * All sound effects are SYNTHESISED with the Web Audio API rather than shipped

@@ -21,6 +21,7 @@ import {
   resolveConfig,
   type GameConfig,
 } from "../../../shared/game-config";
+import { asset } from "../lib/assets";
 import {
   ZERO_EFFECTS,
   combineEffects,
@@ -291,7 +292,7 @@ function catalogue() {
       coinPrice: tierPriceCoin(cfg, i),
       boostPercent: skinFx.tapPercent,
       effects: skinFx,
-      imageUrl: ASSET.skin[`skin_${TIER_NAMES[i]!.toLowerCase()}` as keyof typeof ASSET.skin]!,
+      imageUrl: asset(ASSET.skin[`skin_${TIER_NAMES[i]!.toLowerCase()}` as keyof typeof ASSET.skin]!),
     });
     rows.push({
       slug: `btn_${TIER_NAMES[i]!.toLowerCase()}`,
@@ -304,7 +305,7 @@ function catalogue() {
       coinPrice: tierPriceCoin(cfg, i),
       boostPercent: btnFx.tapPercent,
       effects: btnFx,
-      imageUrl: ASSET.btn[`btn_${TIER_NAMES[i]!.toLowerCase()}` as keyof typeof ASSET.btn]!,
+      imageUrl: asset(ASSET.btn[`btn_${TIER_NAMES[i]!.toLowerCase()}` as keyof typeof ASSET.btn]!),
     });
   }
   return rows;
