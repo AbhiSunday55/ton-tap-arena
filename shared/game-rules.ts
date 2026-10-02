@@ -9,6 +9,12 @@ import {
   resolveConfig,
   type GameConfig,
 } from "../shared/game-config";
+import {
+  effectiveEnergyCap,
+  effectiveRegenSeconds,
+  ZERO_EFFECTS,
+  type ItemEffects,
+} from "../shared/item-effects";
 
 export { resolveConfig, leagueFor };
 export type { GameConfig };
@@ -29,22 +35,28 @@ export interface BoosterUsage {
 
 const RIG_KEYS = ["scrap_rig", "steel_rig", "plasma_rig", "quantum_rig"];
 
-/** Energy regenerates lazily: 1 point per `energyRegenSeconds`. */
+/**
+ * Energy regenerates lazily. `effects` raises the ceiling and shortens the tick;
+ * both are passed through the helpers in item-effects.ts so the enforced numbers
+ * are the same ones the UI displays.
+ */
 export function regenEnergy(
   cfg: GameConfig,
   energy: number,
   energyUpdatedAt: Date,
   now: Date,
+  effects: ItemEffects = ZERO_EFFECTS,
 ): { energy: number; energyUpdatedAt: Date } {
-  const cap = cfg.energyCap;
+  const cap = effectiveEnergyCap(cfg, effects);
+  const regenSeconds = effectiveRegenSeconds(cfg, effects);
   if (energy >= cap) return { energy: cap, energyUpdatedAt: now };
   const seconds = Math.max(0, (now.getTime() - energyUpdatedAt.getTime()) / 1000);
-  const gained = Math.floor(seconds / Math.max(0.1, cfg.energyRegenSeconds));
+  const gained = Math.floor(seconds / Math.max(0.1, regenSeconds));
   if (gained <= 0) return { energy, energyUpdatedAt };
   const next = Math.min(cap, energy + gained);
   if (next >= cap) return { energy: cap, energyUpdatedAt: now };
   // Keep the sub-unit remainder: advancing by the whole step only.
-  const consumedMs = gained * cfg.energyRegenSeconds * 1000;
+  const consumedMs = gained * regenSeconds * 1000;
   return { energy: next, energyUpdatedAt: new Date(energyUpdatedAt.getTime() + consumedMs) };
 }
 
@@ -56,25 +68,41 @@ export function turboActive(
   return !!turboUntil && turboUntil.getTime() > now.getTime();
 }
 
-/** Returns BOTH the next combo count and the multiplier it earns. */
+/**
+ * Returns BOTH the next combo count and the multiplier it earns.
+ *
+ * `effects.comboBonusPercent` scales the ramp AND the ceiling, so an engaged
+ * button's combo bonus is worth real coins — a bare "+N% combo" that only nudged
+ * the step would be invisible once the cap was reached.
+ */
 export function comboFor(
   cfg: GameConfig,
   comboCount: number,
   lastTapAt: Date | null | undefined,
   now: Date,
+  effects: ItemEffects = ZERO_EFFECTS,
 ): { count: number; mult: number } {
   const fresh =
     !!lastTapAt && now.getTime() - lastTapAt.getTime() <= cfg.comboWindowMs;
   const count = fresh ? comboCount + 1 : 1;
-  const mult = Math.min(
-    cfg.comboMaxMultiplier,
-    1 + ((count - 1) * cfg.comboStepPercent) / 100,
-  );
+  const bonus = 1 + Math.max(0, effects.comboBonusPercent) / 100;
+  const step = cfg.comboStepPercent * bonus;
+  const ceil = cfg.comboMaxMultiplier * bonus;
+  const mult = Math.min(ceil, 1 + ((count - 1) * step) / 100);
   return { count, mult: Math.round(mult * 100) / 100 };
 }
 
-/** The one place a tap reward is computed. */
-export function tapRewardPerTap(
+/**
+ * Exact, UNROUNDED reward for a single tap.
+ *
+ * This exists because rounding per tap destroys every bonus below 100%: a base
+ * reward of 1 with a +45% skin is 1.45, which `Math.round` sends straight back
+ * to 1 — the player pays for the item and their tap is worth exactly what it was
+ * before. The integer the player is paid therefore comes from
+ * `settleTapBatch`, which carries the leftover fraction forward so the bonus
+ * accumulates into whole coins instead of evaporating on every tap.
+ */
+export function tapRewardPerTapExact(
   cfg: GameConfig,
   args: {
     leagueMult: number;
@@ -88,13 +116,32 @@ export function tapRewardPerTap(
     cfg.tapBaseReward * args.tapPowerLevel * args.leagueMult * args.comboMult;
   const withItems = base * (1 + args.itemBoostPercent / 100);
   const withTurbo = args.turbo ? withItems * cfg.turboMultiplier : withItems;
-  return Math.max(0, Math.round(withTurbo));
+  return Math.max(0, withTurbo);
+}
+
+/** The one place a tap reward is computed, for display. */
+export function tapRewardPerTap(
+  cfg: GameConfig,
+  args: {
+    leagueMult: number;
+    tapPowerLevel: number;
+    comboMult: number;
+    itemBoostPercent: number;
+    turbo: boolean;
+  },
+): number {
+  return Math.max(0, Math.round(tapRewardPerTapExact(cfg, args)));
 }
 
 export interface TapBatchResult {
   taps: number;
   coins: number;
   perTap: number;
+  /**
+   * Sub-coin fraction carried into the next batch. Persisted, so a bonus that
+   * pays less than 1 COIN per tap still adds up instead of rounding to nothing.
+   */
+  coinCarry: number;
   energy: number;
   energyUpdatedAt: Date;
   comboCount: number;
@@ -118,15 +165,21 @@ export function settleTapBatch(
     comboCount: number;
     lastTapAt: Date | null;
     leagueCoinMined: number;
+    /** Sub-coin fraction carried in from the previous batch. */
+    coinCarry?: number;
+    /** The equipped skin + button effects. Defaults to none. */
+    effects?: ItemEffects;
   },
   requestedTaps: number,
   now: Date,
 ): TapBatchResult {
+  const effects = state.effects ?? ZERO_EFFECTS;
+  const cap = effectiveEnergyCap(cfg, effects);
   const taps = Math.max(0, Math.min(cfg.tapBatchMax, Math.floor(requestedTaps)));
-  const regen = regenEnergy(cfg, state.energy, state.energyUpdatedAt, now);
+  const regen = regenEnergy(cfg, state.energy, state.energyUpdatedAt, now, effects);
   const payable = Math.min(taps, regen.energy);
 
-  const combo = comboFor(cfg, state.comboCount, state.lastTapAt, now);
+  const combo = comboFor(cfg, state.comboCount, state.lastTapAt, now, effects);
   const comboMult = combo.mult;
   const league = leagueFor(cfg, state.leagueCoinMined);
   const turbo = turboActive(cfg, state.turboUntil, now);
@@ -134,20 +187,34 @@ export function settleTapBatch(
     leagueMult: league.mult,
     tapPowerLevel: state.tapPowerLevel,
     comboMult,
-    itemBoostPercent: state.itemBoostPercent,
+    itemBoostPercent: effects.tapPercent,
     turbo,
   });
+  const perTapExact = tapRewardPerTapExact(cfg, {
+    leagueMult: league.mult,
+    tapPowerLevel: state.tapPowerLevel,
+    comboMult,
+    itemBoostPercent: effects.tapPercent,
+    turbo,
+  });
+
+  // Pay the whole coins now and keep the fraction for the next batch. Without
+  // this, every bonus under +100% would round away on each tap.
+  const exact = perTapExact * payable + Math.max(0, state.coinCarry ?? 0);
+  const coins = Math.floor(exact);
+  const coinCarry = exact - coins;
 
   const energy = regen.energy - payable;
   // Spending energy restarts the regen clock from empty only when we actually
   // drained it; otherwise keep the accumulated remainder.
   const energyUpdatedAt =
-    regen.energy >= cfg.energyCap && payable > 0 ? now : regen.energyUpdatedAt;
+    regen.energy >= cap && payable > 0 ? now : regen.energyUpdatedAt;
 
   return {
     taps: payable,
-    coins: perTap * payable,
+    coins,
     perTap,
+    coinCarry,
     energy,
     energyUpdatedAt,
     comboCount: payable > 0 ? combo.count : state.comboCount,
@@ -159,15 +226,20 @@ export function settleTapBatch(
   };
 }
 
-/** Passive income from owned rigs since the last accrual. */
+/**
+ * Passive income from owned rigs since the last accrual, plus whatever the
+ * equipped skin adds per hour. The item trickle is deliberately included here so
+ * a cosmetic's passive stat is real income rather than a label.
+ */
 export function settleRigs(
   cfg: GameConfig,
   rigsOwned: RigsOwned,
   since: Date,
   now: Date,
+  effects: ItemEffects = ZERO_EFFECTS,
 ): { coins: number; at: Date } {
   const seconds = Math.max(0, (now.getTime() - since.getTime()) / 1000);
-  let perHour = 0;
+  let perHour = Math.max(0, effects.passivePerHour);
   for (const key of RIG_KEYS) {
     const lvl = Number(rigsOwned?.[key] ?? 0);
     if (!lvl) continue;
@@ -190,8 +262,15 @@ export function rigPerHour(cfg: GameConfig, key: string): number {
 
 export const RIG_KEYS_EXPORT = RIG_KEYS;
 
-export function totalRigPerHour(cfg: GameConfig, rigsOwned: RigsOwned): number {
-  return RIG_KEYS.reduce((sum, k, i) => sum + (Number(rigsOwned?.[k] ?? 0) * (cfg.rigs[i]?.perHour ?? 0)), 0);
+export function totalRigPerHour(
+  cfg: GameConfig,
+  rigsOwned: RigsOwned,
+  effects: ItemEffects = ZERO_EFFECTS,
+): number {
+  return (
+    RIG_KEYS.reduce((sum, k, i) => sum + (Number(rigsOwned?.[k] ?? 0) * (cfg.rigs[i]?.perHour ?? 0)), 0) +
+    Math.max(0, effects.passivePerHour)
+  );
 }
 
 /** Booster bookkeeping — counters reset on a new UTC day. */

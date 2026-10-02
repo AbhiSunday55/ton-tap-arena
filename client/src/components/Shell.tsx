@@ -1,5 +1,4 @@
 import { useEffect, useState } from "react";
-import { Link } from "wouter";
 import { useGame } from "../lib/store";
 import { useAudio } from "../lib/audio";
 import { fmtShort, nanoToTon, fmtTon } from "../lib/format";
@@ -106,10 +105,6 @@ export default function Shell() {
         >
           {muted ? "🔇" : "🔊"}
         </button>
-
-        <Link href="/admin" className="icon-btn" title="Admin panel" aria-label="Admin panel">
-          ⚙️
-        </Link>
 
         <div className="pills">
           <div className="pill">

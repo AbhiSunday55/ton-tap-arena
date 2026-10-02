@@ -15,6 +15,16 @@ export function fmtShort(n: number): string {
   return fmtInt(n);
 }
 
+/** Coin amounts with up to 2 decimals — used where a bonus can be fractional
+ *  (e.g. "+45% tap power" on a base of 1.00). Whole numbers stay clean. */
+export function fmtCoin(n: number): string {
+  if (!Number.isFinite(n)) return "0";
+  const rounded = Math.round(n * 100) / 100;
+  return Number.isInteger(rounded)
+    ? fmtInt(rounded)
+    : rounded.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
 export function nanoToTon(nano: number): number {
   return nano / NANO;
 }

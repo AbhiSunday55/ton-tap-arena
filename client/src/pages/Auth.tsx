@@ -114,8 +114,8 @@ export default function AuthPage() {
           </div>
 
           <div className="foot-note">
-            <b>Demo build.</b> Crypto amounts are illustrative. Payouts require a
-            TON-format treasury address, set in the admin panel.
+            Your progress is stored on our servers, so signing in on another device picks up
+            exactly where you left off.
           </div>
         </div>
       </div>

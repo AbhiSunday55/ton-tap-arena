@@ -42,11 +42,21 @@ import {
   settleRigs,
   settleTapBatch,
   totalRigPerHour,
+  tapRewardPerTap,
+  tapRewardPerTapExact,
   turboActive,
   usdtCentsToNanoTon,
   type BoosterUsage,
   type RigsOwned,
 } from "../shared/game-rules";
+import {
+  combineEffects,
+  effectiveEnergyCap,
+  effectiveRegenSeconds,
+  normalizeEffects,
+  ZERO_EFFECTS,
+  type ItemEffects,
+} from "../shared/item-effects";
 
 const ADMIN_COOKIE = "tap_arena_admin";
 const DEFAULT_ADMIN_PASSWORD = "taparena";
@@ -72,6 +82,105 @@ const SAMPLE_WEEK_CURVE = [
 
 let bootstrapPromise: Promise<{ catalogue: boolean; board: boolean }> | null = null;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Equipped-item effects
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Derive a profile's combined effects from the rows it actually OWNS.
+ *
+ * Deliberately derived rather than stored: the server looks each equipped slug
+ * up in the catalogue and re-reads its recorded effect, so a client can never
+ * assert a bonus it did not buy. Called on every equip/unequip so the cached
+ * `itemEffects` column can never drift from the real loadout.
+ */
+async function recomputeItemEffects(
+  userId: string,
+  equippedSkin: string | null,
+  equippedButton: string | null,
+  catalogue?: q.ShopItem[],
+): Promise<{ effects: ItemEffects; tapPercent: number }> {
+  const items = catalogue ?? (await q.listShopItems());
+  const owned = new Set(await q.ownedItemSlugs(userId));
+
+  const pick = (slug: string | null, category: "skin" | "button"): ItemEffects => {
+    if (!slug) return ZERO_EFFECTS;
+    const item = items.find((i) => i.slug === slug && i.category === category);
+    // Not owned => contributes nothing, even if the slug is written on the row.
+    if (!item || !owned.has(item.slug)) return ZERO_EFFECTS;
+    return normalizeEffects(item.effects);
+  };
+
+  const effects = combineEffects(pick(equippedSkin, "skin"), pick(equippedButton, "button"));
+  return { effects, tapPercent: effects.tapPercent };
+}
+
+/**
+ * Equip a category to `slug`, or clear it with `null`, then persist both the
+ * equipped slug and the recomputed effects together.
+ *
+ * Ownership is checked HERE, server-side — a client cannot equip something it
+ * has not bought, which is what makes the bonus trustworthy.
+ */
+async function applyEquip(
+  userId: string,
+  category: "skin" | "button",
+  slug: string | null,
+  catalogue: q.ShopItem[],
+): Promise<{ effects: ItemEffects; tapPercent: number }> {
+  const profile = await q.getProfile(userId);
+  if (!profile) throw new TRPCError({ code: "NOT_FOUND", message: "No player profile." });
+
+  if (slug) {
+    const item = catalogue.find((i) => i.slug === slug);
+    if (!item) throw new TRPCError({ code: "NOT_FOUND", message: "That item does not exist." });
+    if (item.category !== category) {
+      throw new TRPCError({ code: "BAD_REQUEST", message: `That item is not a ${category}.` });
+    }
+    const owned = await q.ownedItemSlugs(userId);
+    if (!owned.includes(slug)) {
+      throw new TRPCError({ code: "FORBIDDEN", message: `You do not own ${item.name}.` });
+    }
+  }
+
+  const nextSkin = category === "skin" ? slug : profile.equippedSkin || null;
+  const nextButton = category === "button" ? slug : profile.equippedButton || null;
+  const { effects, tapPercent } = await recomputeItemEffects(
+    userId,
+    nextSkin,
+    nextButton,
+    catalogue,
+  );
+
+  await q.updateProfile(userId, {
+    equippedSkin: nextSkin ?? "",
+    equippedButton: nextButton ?? "",
+    itemEffects: effects,
+    itemBoostPercent: tapPercent,
+  });
+  return { effects, tapPercent };
+}
+
+/**
+ * Buying an asset equips it immediately.
+ *
+ * Players reasonably expect the thing they just paid for to be live, and a
+ * purchase that changed nothing until a second, separate tap is exactly the
+ * "bought it and nothing happened" complaint this whole feature exists to fix.
+ * Buying is therefore also equipping; the shop can still switch back afterwards.
+ */
+async function autoEquipAfterPurchase(
+  userId: string,
+  category: string,
+  slug: string,
+  catalogue: q.ShopItem[],
+): Promise<void> {
+  const cat = category === "button" ? "button" : "skin";
+  const item = catalogue.find((i) => i.slug === slug);
+  if (!item) return;
+  await applyEquip(userId, cat, slug, catalogue);
+}
+
 /**
  * Idempotent first-run population of the catalogue and the sample leaderboard.
  * Memoised for the process lifetime so a burst of first requests all await the
@@ -84,7 +193,13 @@ async function ensureBootstrapped(cfg: GameConfig): Promise<{ catalogue: boolean
     let board = false;
 
     // Both halves are checked independently — see countOffers() in db.ts.
-    if ((await q.countShopItems()) === 0 || (await q.countOffers()) === 0) {
+    // The effects check repairs a catalogue that predates the effects column:
+    // without it those rows would stay inert forever.
+    if (
+      (await q.countShopItems()) === 0 ||
+      (await q.countOffers()) === 0 ||
+      (await q.countItemsMissingEffects()) > 0
+    ) {
       await seedCatalogue();
       catalogue = true;
     }
@@ -131,8 +246,10 @@ async function syncProfile(userId: string, cfg: GameConfig) {
   let energy = before.energy;
   let energyUpdatedAt = before.energyUpdatedAt;
 
-  // Energy regen
-  const regen = regenEnergy(cfg, before.energy, before.energyUpdatedAt, now);
+  // Energy regen — the equipped button's bonuses raise the ceiling and
+  // shorten the tick, so the same numbers the UI shows are the ones enforced.
+  const effects = normalizeEffects(before.itemEffects);
+  const regen = regenEnergy(cfg, before.energy, before.energyUpdatedAt, now, effects);
   if (regen.energy !== before.energy) {
     energy = regen.energy;
     energyUpdatedAt = regen.energyUpdatedAt;
@@ -140,8 +257,14 @@ async function syncProfile(userId: string, cfg: GameConfig) {
     patch.energyUpdatedAt = energyUpdatedAt;
   }
 
-  // Passive rig income
-  const rigs = settleRigs(cfg, (before.rigsOwned ?? {}) as RigsOwned, before.rigAccruedAt, now);
+  // Passive rig income — plus whatever the equipped skin trickles in per hour.
+  const rigs = settleRigs(
+    cfg,
+    (before.rigsOwned ?? {}) as RigsOwned,
+    before.rigAccruedAt,
+    now,
+    effects,
+  );
   if (rigs.coins > 0) {
     patch.balanceCoin = before.balanceCoin + rigs.coins;
     patch.totalCoinMined = before.totalCoinMined + rigs.coins;
@@ -187,6 +310,12 @@ function buildState(profile: q.Profile, cfg: GameConfig) {
   const rechargeLeft = Math.max(0, cfg.rechargeFreePerDay - usage.usage.recharge);
 
   const withdraw = quoteWithdrawal(cfg, profile.balanceNanoTon);
+  // The equipped loadout, as the client renders it. `energyCap` and
+  // `energyRegenSeconds` are derived here so a displayed ceiling can never
+  // disagree with the enforced one.
+  const itemEffects = normalizeEffects(profile.itemEffects);
+  const energyCap = effectiveEnergyCap(cfg, itemEffects);
+  const energyRegenSeconds = effectiveRegenSeconds(cfg, itemEffects);
 
   return {
     serverNow: new Date().toISOString(),
@@ -205,6 +334,9 @@ function buildState(profile: q.Profile, cfg: GameConfig) {
       energyUpdatedAt: profile.energyUpdatedAt.toISOString(),
       tapPowerLevel: profile.tapPowerLevel,
       itemBoostPercent: profile.itemBoostPercent,
+      itemEffects,
+      energyCap,
+      energyRegenSeconds,
       turboUntil: profile.turboUntil ? profile.turboUntil.toISOString() : null,
       streakDay: profile.streakDay,
       streakClaimedToday: profile.streakClaimedDayKey === dayKey(),
@@ -212,6 +344,32 @@ function buildState(profile: q.Profile, cfg: GameConfig) {
       referralPremium: profile.referralPremium,
       equippedSkin: profile.equippedSkin,
       equippedButton: profile.equippedButton,
+      /**
+       * The concrete COIN a single tap is worth right now with the equipped
+       * loadout, at this player's league and tap-power level and at combo ×1.
+       * The shop's before/after preview recomputes this with a candidate item's
+       * tap bonus, so both sides compare on identical footing.
+       */
+      tapPowerPerTap: tapRewardPerTap(cfg, {
+        leagueMult: league.mult,
+        tapPowerLevel: profile.tapPowerLevel,
+        comboMult: 1,
+        itemBoostPercent: itemEffects.tapPercent,
+        turbo: false,
+      }),
+      /**
+       * The same figure BEFORE rounding. A +45% skin on a base of 1 COIN makes a
+       * tap worth 1.45, which the integer view would show as a flat "1" — i.e.
+       * a purchased item that looks like it did nothing. The UI shows this
+       * figure so an equipped bonus is visibly working.
+       */
+      tapPowerPerTapExact: tapRewardPerTapExact(cfg, {
+        leagueMult: league.mult,
+        tapPowerLevel: profile.tapPowerLevel,
+        comboMult: 1,
+        itemBoostPercent: itemEffects.tapPercent,
+        turbo: false,
+      }),
       soundEnabled: profile.soundEnabled,
       isAdmin: profile.isAdmin,
       walletAddress: profile.walletAddress,
@@ -260,7 +418,7 @@ function buildState(profile: q.Profile, cfg: GameConfig) {
         owned: Number((profile.rigsOwned as RigsOwned)?.[key] ?? 0),
       };
     }),
-    rigPerHour: totalRigPerHour(cfg, (profile.rigsOwned ?? {}) as RigsOwned),
+    rigPerHour: totalRigPerHour(cfg, (profile.rigsOwned ?? {}) as RigsOwned, itemEffects),
     streakRewards: cfg.streakRewards,
     withdraw,
     turboActive: turboActive(cfg, profile.turboUntil, new Date()),
@@ -407,6 +565,10 @@ const gameRouter = router({
           energyUpdatedAt: profile.energyUpdatedAt,
           tapPowerLevel: profile.tapPowerLevel,
           itemBoostPercent: profile.itemBoostPercent,
+          effects: normalizeEffects(profile.itemEffects),
+          // Micro-COIN fraction from the previous batch, so a bonus worth less
+          // than 1 COIN per tap still accumulates into real coins.
+          coinCarry: (profile.coinCarryMicro ?? 0) / 1_000_000,
           turboUntil: profile.turboUntil,
           comboCount: profile.comboCount,
           lastTapAt: profile.lastTapAt,
@@ -422,6 +584,7 @@ const gameRouter = router({
           energyUpdatedAt: result.energyUpdatedAt,
           comboCount: result.comboCount,
           lastTapAt: result.lastTapAt,
+          coinCarryMicro: Math.round(result.coinCarry * 1_000_000),
           balanceCoin: profile.balanceCoin + result.coins,
           totalCoinMined: profile.totalCoinMined + result.coins,
           weekCoinMined: profile.weekCoinMined + result.coins,
@@ -460,6 +623,9 @@ const gameRouter = router({
     .mutation(async ({ ctx, input }) => {
       const cfg = await q.getConfig();
       const profile = await syncProfile(ctx.user.id, cfg);
+      // Refills fill to the EFFECTIVE ceiling, not the base one — otherwise an
+      // equipped button's energy bonus would be unreachable via boosters.
+      const cap = effectiveEnergyCap(cfg, normalizeEffects(profile.itemEffects));
       const today = dayKey();
       const { usage } = freshBoosterUsage(
         cfg,
@@ -501,10 +667,10 @@ const gameRouter = router({
           : Date.now();
         patch.turboUntil = new Date(base + cfg.turboDurationSec * 1000);
       } else if (input.kind === "energy") {
-        patch.energy = cfg.energyCap;
+        patch.energy = cap;
         patch.energyUpdatedAt = new Date();
       } else {
-        patch.energy = Math.min(cfg.energyCap, profile.energy + cfg.rechargeAmount);
+        patch.energy = Math.min(cap, profile.energy + cfg.rechargeAmount);
         patch.energyUpdatedAt = new Date();
         patch.rechargeReadyAt = new Date(Date.now() + cfg.rechargeCooldownSec * 1000);
       }
@@ -621,25 +787,40 @@ const gameRouter = router({
     .mutation(async ({ ctx, input }) => {
       const cfg = await q.getConfig();
       await syncProfile(ctx.user.id, cfg);
-      const owned = await q.ownedItemSlugs(ctx.user.id);
-      const patch: Partial<q.Profile> = {};
-
-      if (input.soundEnabled !== undefined) patch.soundEnabled = input.soundEnabled;
-
-      if (input.equippedSkin) {
-        if (!owned.includes(input.equippedSkin))
-          throw new TRPCError({ code: "FORBIDDEN", message: "You do not own that skin." });
-        patch.equippedSkin = input.equippedSkin;
-        const item = (await q.listShopItems()).find((i) => i.slug === input.equippedSkin);
-        patch.itemBoostPercent = item?.boostPercent ?? 0;
+      if (input.soundEnabled !== undefined) {
+        await q.updateProfile(ctx.user.id, { soundEnabled: input.soundEnabled });
       }
-      if (input.equippedButton) {
-        if (!owned.includes(input.equippedButton))
-          throw new TRPCError({ code: "FORBIDDEN", message: "You do not own that button." });
-        patch.equippedButton = input.equippedButton;
+      const catalogue = await q.listShopItems();
+      // `undefined` means "leave this slot alone"; an empty string reaches
+      // applyEquip as null and clears it.
+      if (input.equippedSkin !== undefined) {
+        await applyEquip(ctx.user.id, "skin", input.equippedSkin || null, catalogue);
       }
+      if (input.equippedButton !== undefined) {
+        await applyEquip(ctx.user.id, "button", input.equippedButton || null, catalogue);
+      }
+      return requireState(ctx, cfg);
+    }),
 
-      if (Object.keys(patch).length) await q.updateProfile(ctx.user.id, patch);
+  /**
+   * Equip or unequip a shop asset, re-deriving the effect record on the way.
+   *
+   * `slug: null` (or "") clears the slot. This is the single entry point the
+   * shop's Equip / Unequip control calls, so the flow is symmetric.
+   */
+  equipItem: protectedProcedure
+    .input(
+      z.object({
+        category: z.enum(["skin", "button"]),
+        slug: z.string().nullable(),
+      }),
+    )
+    .mutation(async ({ ctx, input }) => {
+      const cfg = await q.getConfig();
+      await syncProfile(ctx.user.id, cfg);
+      const slug = input.slug && input.slug.length > 0 ? input.slug : null;
+      const catalogue = await q.listShopItems();
+      await applyEquip(ctx.user.id, input.category, slug, catalogue);
       return requireState(ctx, cfg);
     }),
 });
@@ -775,6 +956,9 @@ const shopRouter = router({
         priceTon: nanoTonToTonString(usdtCentsToNanoTon(cfg, i.priceUsdtCents)),
         coinPrice: Number(i.coinPrice),
         boostPercent: i.boostPercent,
+        /** The real effect record — the client renders its stat lines and the
+         *  before/after preview from this, so a card can never overstate. */
+        effects: normalizeEffects(i.effects),
         imageUrl: i.imageUrl,
         owned: owned.has(i.slug),
         equipped:
@@ -838,6 +1022,13 @@ const shopRouter = router({
           refType: "purchase",
           refId: item.slug,
         });
+        // A purchase that changes nothing is a dead purchase — equip it now.
+        await autoEquipAfterPurchase(
+          ctx.user.id,
+          item.category,
+          item.slug,
+          await q.listShopItems(),
+        );
         return { mode: "settled" as const, item: item.name, state: await requireState(ctx, cfg) };
       }
 
@@ -922,6 +1113,12 @@ const shopRouter = router({
         refType: "purchase",
         refId: input.slug,
       });
+      // Deliver the effect immediately, same as the off-chain rails.
+      const catalogue = await q.listShopItems();
+      const bought = catalogue.find((i) => i.slug === input.slug);
+      if (bought) {
+        await autoEquipAfterPurchase(ctx.user.id, bought.category, bought.slug, catalogue);
+      }
       return requireState(ctx, cfg);
     }),
 

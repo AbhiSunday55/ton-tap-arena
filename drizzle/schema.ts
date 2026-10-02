@@ -10,6 +10,7 @@ import {
   jsonb,
   uniqueIndex,
 } from "drizzle-orm/pg-core";
+import type { ItemEffects } from "../shared/item-effects";
 
 // ═════════════════════════════════════════════════════════════════════════════
 // SYSTEM TABLES — managed by the scaffold. The Agent MUST NOT redefine or drop
@@ -80,7 +81,24 @@ export const playerProfiles = pgTable(
     rigsOwned: jsonb("rigs_owned").notNull().default([]),
     rigAccruedAt: timestamp("rig_accrued_at", { withTimezone: true }).notNull().defaultNow(),
     itemBoostPercent: integer("item_boost_percent").notNull().default(0),
+    /**
+     * The equipped skin + button effects, COMBINED and cached at equip time.
+     * This is the record every reward calculation reads; `shared/item-effects.ts`
+     * owns its shape. It is derived from owned rows on the server, never sent up
+     * by a client — that is what makes a shop bonus un-fakeable.
+     */
+    itemEffects: jsonb("item_effects")
+      .$type<ItemEffects>()
+      .notNull()
+      .default({ tapPercent: 0, energyCapBonus: 0, energyRegenPercent: 0, comboBonusPercent: 0, passivePerHour: 0 }),
     comboCount: integer("combo_count").notNull().default(0),
+    /**
+     * Sub-coin fraction left over from the last tap batch, carried forward.
+     * Stored as micro-COIN (1e-6) in an integer so the arithmetic stays exact —
+     * this is what makes a +3% or +16% skin actually pay instead of rounding to
+     * nothing tap after tap.
+     */
+    coinCarryMicro: integer("coin_carry_micro").notNull().default(0),
     lastTapAt: timestamp("last_tap_at", { withTimezone: true }),
     turboUntil: timestamp("turbo_until", { withTimezone: true }),
     boosterDayKey: text("booster_day_key"),
@@ -134,6 +152,11 @@ export const shopItems = pgTable(
     category: text("category").notNull(), // 'skin' | 'button'
     tierIndex: integer("tier_index").notNull().default(0),
     tier: text("tier").notNull().default("Common"),
+    /** Real gameplay effect this item grants while equipped. */
+    effects: jsonb("effects")
+      .$type<ItemEffects>()
+      .notNull()
+      .default({ tapPercent: 0, energyCapBonus: 0, energyRegenPercent: 0, comboBonusPercent: 0, passivePerHour: 0 }),
     priceUsdtCents: integer("price_usdt_cents").notNull().default(50),
     coinPrice: bigint("coin_price", { mode: "number" }).notNull().default(0),
     boostPercent: integer("boost_percent").notNull().default(0),

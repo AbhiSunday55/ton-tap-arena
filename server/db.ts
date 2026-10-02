@@ -22,6 +22,7 @@ import {
   withdrawals,
 } from "../drizzle/schema";
 import { resolveConfig, type GameConfig } from "../shared/game-config";
+import { tierEffects } from "../shared/item-effects";
 
 export type Profile = typeof playerProfiles.$inferSelect;
 export type ShopItem = typeof shopItems.$inferSelect;
@@ -233,7 +234,17 @@ export async function upsertShopItemSafe(row: {
   imageUrl: string;
   active: boolean;
 }): Promise<void> {
-  const values = { ...row, sortOrder: row.tierIndex };
+  // Effects are DERIVED from (category, tier) rather than taken from the form.
+  // That keeps two invariants no matter what an operator types: an item always
+  // has a real effect, and a higher tier is always stronger. `boostPercent` is
+  // then kept in step with the curve so the legacy column cannot disagree.
+  const derived = tierEffects(row.category, row.tierIndex);
+  const values = {
+    ...row,
+    sortOrder: row.tierIndex,
+    effects: derived,
+    boostPercent: derived.tapPercent,
+  };
   await db
     .insert(shopItems)
     .values(values)
@@ -248,6 +259,7 @@ export async function upsertShopItemSafe(row: {
         priceUsdtCents: values.priceUsdtCents,
         coinPrice: values.coinPrice,
         boostPercent: values.boostPercent,
+        effects: values.effects,
         imageUrl: values.imageUrl,
         active: values.active,
         sortOrder: values.sortOrder,
@@ -435,13 +447,45 @@ export async function listAllPurchases(limit = 100) {
   return rows.map((r) => ({ ...r.p, handle: r.handle, email: r.email }));
 }
 
+/**
+ * Catalogue rows with an INERT effect record (every stat zero).
+ *
+ * This is the bootstrap trigger for repairing a catalogue seeded before the
+ * effects column existed. Without it, `countShopItems()` stays non-zero after
+ * the column is added, the seed never re-runs, and every asset silently keeps a
+ * zeroed effect forever — the shop would look healthy while nothing worked.
+ *
+ * A real item always has at least one non-zero stat, so "all five are zero"
+ * reliably means "not yet stamped with a curve". `coalesce` covers both a null
+ * column and a jsonb object that predates the keys.
+ */
+export async function countItemsMissingEffects(): Promise<number> {
+  const [row] = await db
+    .select({ n: sql<number>`count(*)::int` })
+    .from(shopItems)
+    .where(
+      sql`coalesce((${shopItems.effects}->>'tapPercent')::int, 0) = 0
+          and coalesce((${shopItems.effects}->>'energyCapBonus')::int, 0) = 0
+          and coalesce((${shopItems.effects}->>'energyRegenPercent')::int, 0) = 0
+          and coalesce((${shopItems.effects}->>'comboBonusPercent')::int, 0) = 0
+          and coalesce((${shopItems.effects}->>'passivePerHour')::int, 0) = 0`,
+    );
+  return Number(row?.n ?? 0);
+}
+
 export async function ownedItemSlugs(userId: string): Promise<string[]> {
   const rows = await db
     .select({ slug: purchases.itemSlug, status: purchases.status })
     .from(purchases)
     .where(eq(purchases.userId, userId));
-  return rows.filter((r) => r.status !== "failed").map((r) => r.slug);
+  // Only SETTLED orders grant ownership. Counting `pending` here would let a
+  // player equip an item whose on-chain payment has not been confirmed — i.e.
+  // claim the gameplay bonus for free by walking away from the invoice.
+  return rows.filter((r) => SETTLED_PURCHASE_STATUSES.includes(r.status)).map((r) => r.slug);
 }
+
+/** Order states that mean "the money actually arrived". */
+export const SETTLED_PURCHASE_STATUSES = ["paid", "offchain"];
 
 /** Records the order. `onConflictDoNothing` makes a repeat purchase a no-op. */
 export async function createPurchase(row: typeof purchases.$inferInsert): Promise<boolean> {

@@ -70,14 +70,27 @@ class LocalAuthProvider implements AuthProvider {
   }
 
   async #setSession(c: Context, userId: string): Promise<void> {
-    const token = await new SignJWT({})
-      .setProtectedHeader({ alg: "HS256" })
-      .setSubject(userId)
-      .setIssuedAt()
-      .setExpirationTime("30d")
-      .sign(secretKey);
-    setCookie(c, COOKIE, token, sessionCookieOptions(env.isProd || requestIsSecure(c)));
+    await issueSessionCookie(c, userId);
   }
+}
+
+/**
+ * Mint the session JWT and set the auth cookie.
+ *
+ * Extracted so EVERY way of establishing a session lands on the same cookie —
+ * email + password today, a validated Telegram initData payload next. Without
+ * this, a second sign-in path would have to re-implement the JWT and could
+ * drift (different key, missing expiry) in a way that only shows up as players
+ * being silently logged out.
+ */
+export async function issueSessionCookie(c: Context, userId: string): Promise<void> {
+  const token = await new SignJWT({})
+    .setProtectedHeader({ alg: "HS256" })
+    .setSubject(userId)
+    .setIssuedAt()
+    .setExpirationTime("30d")
+    .sign(secretKey);
+  setCookie(c, COOKIE, token, sessionCookieOptions(env.isProd || requestIsSecure(c)));
 }
 
 // Reserved for post-M1 SSO (OIDC / Teamily IdP). NOT implemented — its presence

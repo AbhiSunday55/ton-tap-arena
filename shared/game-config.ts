@@ -94,11 +94,32 @@ export interface GameConfig {
 
   // ── ads (placeholder slot — no ad network wired) ──
   adEnabled: boolean;
+  /** Ad network selector. `adsgram` drives the real SDK; `placeholder` is the
+   *  built-in simulated slot for use before a network is connected. */
+  adProvider: string;
+  /** Adsgram block ID (their dashboard calls it a block, not a unit). */
   adUnitId: string;
   adLink: string;
   adRewardCoin: number;
   adDailyLimit: number;
   adWatchSeconds: number;
+
+  // ── Telegram Mini App ──
+  /**
+   * Bot token. A SECRET: it is only ever read server-side to validate initData
+   * and to call the Bot API. It is never included in any client payload, and
+   * every admin read returns a masked form. Empty means "fall back to the
+   * TELEGRAM_BOT_TOKEN environment variable".
+   */
+  telegramBotToken: string;
+  /** Public @handle, safe to show. */
+  telegramBotUsername: string;
+  /** Secret token Telegram echoes back on webhook calls. */
+  telegramWebhookSecret: string;
+  /** Public https URL of this app, used for the menu button + webhook. */
+  telegramMiniAppUrl: string;
+  /** Let players sign in with Telegram instead of email + password. */
+  telegramLoginEnabled: boolean;
 
   // ── leaderboard ──
   leaderboardSize: number;
@@ -201,11 +222,18 @@ export const DEFAULT_CONFIG: GameConfig = {
   shopCoinMultiplier: 100_000,
 
   adEnabled: true,
-  adUnitId: "PLACEHOLDER-AD-UNIT-0001",
+  adProvider: "placeholder",
+  adUnitId: "PLACEHOLDER-AD-BLOCK-0001",
   adLink: "https://example.com/replace-with-your-ad-network",
   adRewardCoin: 2500,
   adDailyLimit: 5,
   adWatchSeconds: 15,
+
+  telegramBotToken: "",
+  telegramBotUsername: "",
+  telegramWebhookSecret: "",
+  telegramMiniAppUrl: "",
+  telegramLoginEnabled: true,
 
   leaderboardSize: 50,
 };
@@ -239,6 +267,7 @@ export const CONFIG_GROUPS = [
   "Referrals",
   "Shop",
   "Ads",
+  "Telegram",
   "Leaderboard",
 ] as const;
 
@@ -329,14 +358,78 @@ export const CONFIG_FIELDS: ConfigField[] = [
   { path: "shopCoinMultiplier", label: "Coin price multiplier", group: "Shop", type: "number", min: 0, help: "coinPrice = baseUsd × coinMultiplier × tierMultiplier^tierIndex" },
 
   { path: "adEnabled", label: "Ads enabled", group: "Ads", type: "bool" },
-  { path: "adUnitId", label: "Ad unit ID (placeholder)", group: "Ads", type: "text", help: "Paste your ad network's unit ID here once one exists." },
-  { path: "adLink", label: "Ad destination URL", group: "Ads", type: "url", help: "Where the ad slot points. Placeholder until an ad network is connected." },
+  {
+    path: "adProvider",
+    label: "Ad network",
+    group: "Ads",
+    type: "text",
+    help: "`adsgram` uses the real Adsgram SDK (requires a block ID below and the SDK in the Mini App). `placeholder` runs the built-in simulated slot.",
+  },
+  {
+    path: "adUnitId",
+    label: "Adsgram block ID",
+    group: "Ads",
+    type: "text",
+    help: "From the Adsgram dashboard, e.g. `1234` or `task-1234`. Paste it here to switch the slot over to real ads.",
+  },
+  { path: "adLink", label: "Ad destination URL", group: "Ads", type: "url", help: "Where the placeholder slot points. Adsgram serves its own creatives." },
   { path: "adRewardCoin", label: "Coin per ad view", group: "Ads", type: "number", min: 0 },
   { path: "adDailyLimit", label: "Ad views per day", group: "Ads", type: "number", min: 0 },
   { path: "adWatchSeconds", label: "Required watch time (s)", group: "Ads", type: "number", min: 0 },
 
   { path: "leaderboardSize", label: "Leaderboard rows", group: "Leaderboard", type: "number", min: 5, max: 200 },
+
+  {
+    path: "telegramBotToken",
+    label: "Bot token (secret)",
+    group: "Telegram",
+    type: "text",
+    help: "Server-side only — never sent to a browser. Leave the masked value untouched to keep the current token. Empty falls back to the TELEGRAM_BOT_TOKEN env var.",
+  },
+  {
+    path: "telegramBotUsername",
+    label: "Bot username",
+    group: "Telegram",
+    type: "text",
+    help: "Public @handle, without the @.",
+  },
+  {
+    path: "telegramWebhookSecret",
+    label: "Webhook secret (secret)",
+    group: "Telegram",
+    type: "text",
+    help: "Secret token Telegram echoes back on every webhook call, so a forged update can be rejected. Masked like the bot token.",
+  },
+  {
+    path: "telegramMiniAppUrl",
+    label: "Mini App URL",
+    group: "Telegram",
+    type: "url",
+    help: "Public https URL of this app. Used for the menu button and the webhook.",
+  },
+  { path: "telegramLoginEnabled", label: "Allow Telegram sign-in", group: "Telegram", type: "bool" },
 ];
+
+/** Config paths that must NEVER reach a client in full. Any reader that serves
+ *  config to a browser (or a non-admin) strips these; the admin panel sees a
+ *  masked placeholder instead of the value. */
+export const SECRET_CONFIG_PATHS = ["telegramBotToken", "telegramWebhookSecret"] as const;
+
+/** Placeholder shown to an operator in place of a stored secret. Sending this
+ *  back in a save means "unchanged", so an admin can edit other fields without
+ *  ever having read the secret. */
+export const SECRET_MASK = "••••••••••••••••";
+
+/**
+ * Strip secrets from a config object bound for a non-admin client. Without
+ * this, `game.state` would hand every player the bot token, since it returns
+ * the whole config object.
+ */
+export function publicConfig<T extends Record<string, unknown>>(cfg: T): Omit<T, "telegramBotToken" | "telegramWebhookSecret"> {
+  const clone = { ...cfg } as Record<string, unknown>;
+  for (const p of SECRET_CONFIG_PATHS) delete clone[p];
+  return clone as Omit<T, "telegramBotToken" | "telegramWebhookSecret">;
+}
 
 /** Dotted-path get/set on a plain object. */
 export function getPath(obj: Record<string, unknown>, path: string): unknown {

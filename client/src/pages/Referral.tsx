@@ -335,10 +335,6 @@ export default function Referral({ active }: { active: boolean }) {
         Referral bonuses are credited from the {state.cfg.referralRevenueSharePercent}% revenue-share
         pool. Total earned so far: {s ? fmtInt(s.coinsEarned) : 0} COIN
         {s?.code ? ` · code ${truncAddress(s.code, 4, 4)}` : ""}
-        <br />
-        <br />
-        <b>Demo build.</b> Crypto amounts are illustrative; real payouts require a TON-format
-        treasury address.
       </div>
     </section>
   );

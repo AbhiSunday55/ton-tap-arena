@@ -1,11 +1,9 @@
 import { useEffect } from "react";
-import { Route, useLocation } from "wouter";
 import { useAuth } from "./_core/useAuth";
 import { useGame } from "./lib/store";
 import { useAudio } from "./lib/audio";
 import Shell from "./components/Shell";
 import Auth from "./pages/Auth";
-import AdminPage from "./pages/Admin";
 
 /** Telegram Mini App bootstrap: expand to full height and adopt its chrome. */
 function useTelegramChrome() {
@@ -32,19 +30,17 @@ function useTelegramChrome() {
 }
 
 /**
- * Route shell.
+ * Route shell — the game, and only the game.
  *
- * `/admin` is a standalone, password-gated page outside the game shell. Every
- * other path renders `<Shell>`, which owns the six game tabs and their tab bar —
- * so the four original tabs stay exactly where they were, and the three new
- * screens (leaderboard, watch-ads, admin) sit alongside them.
+ * This build ships the player-facing app alone. Management tooling is a
+ * separate, unreleased surface with no route, link or reference here, so there
+ * is nothing in the shipped product for a player to find, click or guess at.
  */
 export default function App() {
   useTelegramChrome();
   const { user, isLoading } = useAuth();
   const { state, toasts } = useGame();
   const { unlock } = useAudio();
-  const [location] = useLocation();
 
   // The first real user gesture is what unlocks WebAudio in every browser.
   useEffect(() => {
@@ -73,15 +69,6 @@ export default function App() {
       ))}
     </div>
   );
-
-  if (location.startsWith("/admin")) {
-    return (
-      <>
-        <Route path="/admin" component={AdminPage} />
-        {toastLayer}
-      </>
-    );
-  }
 
   if (isLoading) {
     return (

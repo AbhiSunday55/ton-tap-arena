@@ -1,9 +1,12 @@
 // ── AGENT-OWNED: idempotent seed ────────────────────────────────────────────
-// Runs on demand from the admin panel. Every write is onConflictDoNothing, so
-// running it twice changes nothing.
+// Runs on demand from the admin panel. Offers are inserted with
+// onConflictDoNothing (a second run changes nothing); shop rows upsert their
+// DERIVED columns so a re-run also repairs items whose effects are missing.
 import { db } from "../_core/db";
+import { sql } from "drizzle-orm";
 import { offers, shopItems } from "../../drizzle/schema";
 import { ASSET, DEFAULT_CONFIG } from "../../shared/game-config";
+import { effectChips, tierEffects } from "../../shared/item-effects";
 import { tierPriceCoin, tierPriceUsdtCents } from "../../shared/game-rules";
 
 const TIERS = [
@@ -15,39 +18,52 @@ const TIERS = [
 ];
 
 const SKIN_NAMES = ["Copper Coin", "Azure Coin", "Violet Coin", "Solar Coin", "Void Coin"];
-const SKIN_DESC = [
-  "A humble starting coin.",
-  "Cobalt plating. +2% tap power.",
-  "Amethyst core. +5% tap power.",
-  "Forged in gold light. +9% tap power.",
-  "A shard of the void itself. +15% tap power.",
-];
-const SKIN_BOOST = [0, 2, 5, 9, 15];
-
 const BTN_NAMES = ["Basic Pad", "Circuit Pad", "Plasma Pad", "Eclipse Pad", "Celestial Pad"];
-const BTN_DESC = [
-  "Standard mining control surface.",
-  "Etched circuitry. +2% tap power.",
-  "Ionised plasma surface. +5% tap power.",
-  "Dark-matter coating. +9% tap power.",
-  "Blessed by the stars. +15% tap power.",
+
+/**
+ * Descriptions are DERIVED from the item's real effect record rather than
+ * hand-written, so a card can never advertise a bonus the server does not
+ * enforce. Change a tier curve and the copy follows automatically.
+ */
+function describe(category: "skin" | "button", index: number, flavor: string): string {
+  const chips = effectChips(tierEffects(category, index));
+  return chips.length ? `${flavor} ${chips.join(" · ")}.` : flavor;
+}
+
+const SKIN_FLAVOR = [
+  "A humble starting coin.",
+  "Cobalt plating.",
+  "Amethyst core.",
+  "Forged in gold light.",
+  "A shard of the void itself.",
 ];
+const BTN_FLAVOR = [
+  "Standard mining control surface.",
+  "Etched circuitry.",
+  "Ionised plasma surface.",
+  "Dark-matter coating.",
+  "Blessed by the stars.",
+];
+
 
 export async function seedCatalogue(): Promise<{ shop: number; offers: number }> {
   const cfg = DEFAULT_CONFIG;
   const shopRows: (typeof shopItems.$inferInsert)[] = [];
 
   TIERS.forEach((t) => {
+    const skinEffects = tierEffects("skin", t.index);
+    const btnEffects = tierEffects("button", t.index);
     shopRows.push({
       slug: t.skin.replace("/assets/", "").replace(".png", ""),
       name: SKIN_NAMES[t.index]!,
-      description: SKIN_DESC[t.index]!,
+      description: describe("skin", t.index, SKIN_FLAVOR[t.index]!),
       category: "skin",
       tierIndex: t.index,
       tier: t.name,
+      effects: skinEffects,
       priceUsdtCents: tierPriceUsdtCents(cfg, t.index),
       coinPrice: tierPriceCoin(cfg, t.index),
-      boostPercent: SKIN_BOOST[t.index]!,
+      boostPercent: skinEffects.tapPercent,
       imageUrl: t.skin,
       active: true,
       sortOrder: t.index,
@@ -55,20 +71,43 @@ export async function seedCatalogue(): Promise<{ shop: number; offers: number }>
     shopRows.push({
       slug: t.btn.replace("/assets/", "").replace(".png", ""),
       name: BTN_NAMES[t.index]!,
-      description: BTN_DESC[t.index]!,
+      description: describe("button", t.index, BTN_FLAVOR[t.index]!),
       category: "button",
       tierIndex: t.index,
       tier: t.name,
+      effects: btnEffects,
       priceUsdtCents: tierPriceUsdtCents(cfg, t.index),
       coinPrice: tierPriceCoin(cfg, t.index),
-      boostPercent: 0,
+      boostPercent: btnEffects.tapPercent,
       imageUrl: t.btn,
       active: true,
       sortOrder: t.index,
     });
   });
 
-  await db.insert(shopItems).values(shopRows).onConflictDoNothing();
+  // One row at a time, so a RE-RUN repairs items that predate the effects
+  // column. A plain `onConflictDoNothing` batch would leave a catalogue already
+  // in the database with all-zero effects forever — the seed would report
+  // success while every asset stayed inert.
+  //
+  // Only the DERIVED columns are refreshed on conflict (description, effects,
+  // boostPercent, tier). Name, image and price are left alone so an admin's own
+  // edits survive a re-seed.
+  for (const row of shopRows) {
+    await db
+      .insert(shopItems)
+      .values(row)
+      .onConflictDoUpdate({
+        target: shopItems.slug,
+        set: {
+          description: sql`excluded.description`,
+          effects: sql`excluded.effects`,
+          boostPercent: sql`excluded.boost_percent`,
+          tierIndex: sql`excluded.tier_index`,
+          tier: sql`excluded.tier`,
+        },
+      });
+  }
 
   const offerRows: (typeof offers.$inferInsert)[] = [
     {

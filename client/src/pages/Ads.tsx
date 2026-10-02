@@ -6,10 +6,9 @@ import { fmtShort, fmtInt } from "../lib/format";
 import { AD_CHEST_IMG } from "../lib/assets";
 
 /**
- * Watch-an-ad screen. No ad network is wired yet, so the slot renders a
- * clearly-labelled placeholder with an editable unit ID, destination link,
- * reward and daily cap — all four are read from the server config and changeable
- * from the admin panel without a redeploy.
+ * Watch-an-ad screen. The slot is driven entirely by server config — network,
+ * unit ID, destination link, reward and daily cap — so connecting an ad network
+ * later is a configuration change with no redeploy.
  *
  * The reward is server-authoritative: `ads.watch` rejects anything shorter than
  * the configured watch time and enforces the daily cap, so a client cannot mint

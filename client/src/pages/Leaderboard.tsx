@@ -7,8 +7,7 @@ const MEDALS = ["🥇", "🥈", "🥉"];
  * Weekly leaderboard. Real players come from `playerProfiles` ranked by
  * `weekCoinMined`; the seeded rivals are merged in so a brand-new app is not an
  * empty board. They are labelled as rivals in the UI rather than passed off as
- * real accounts, and an admin can clear them from the panel in one click.
- * The viewer's own row is highlighted wherever they sit.
+ * real accounts. The viewer's own row is highlighted wherever they sit.
  */
 export default function Leaderboard({ active }: { active: boolean }) {
   const q = trpc.leaderboard.weekly.useQuery(undefined, { enabled: active });
@@ -150,7 +149,7 @@ export default function Leaderboard({ active }: { active: boolean }) {
 
       <div className="foot-note">
         Rivals are house players who keep the arena busy while the league fills up. Beat them to
-        climb the board — an admin can retire them from the panel at any time.
+        climb the board.
       </div>
     </section>
   );

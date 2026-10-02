@@ -3,7 +3,7 @@ import { useTonConnectUI, useTonWallet } from "@tonconnect/ui-react";
 import { trpc } from "../_core/trpc";
 import { useGame } from "../lib/store";
 import { useAudio } from "../lib/audio";
-import { fmtTon, fmtInt, nanoToTon, untilLabel, relativeTime } from "../lib/format";
+import { fmtTon, fmtInt, nanoToTon, relativeTime } from "../lib/format";
 import { truncAddress } from "../lib/format";
 
 /** Decimal TON string → nanoTON string, without floating-point rounding. */
@@ -298,7 +298,7 @@ export default function Wallet({ active, tonBalance }: { active: boolean; tonBal
           {!info.walletConnected
             ? "Connect and verify a wallet — the gate stays locked until then."
             : !info.railArmed
-              ? "⚠️ The on-chain rail is not armed. Set a 32-byte TON treasury address in the admin panel; requests queue off-chain until then."
+              ? "⚠️ Payouts to your wallet are not switched on yet. Your balance is safe and any withdrawal you request is queued."
               : profile.withdrawalPending
                 ? "Your payout is queued. The treasury signs and broadcasts the transfer."
                 : "Immediate vs vested split: " +
@@ -470,12 +470,8 @@ export default function Wallet({ active, tonBalance }: { active: boolean; tonBal
         {info.railArmed ? (
           <span className="mono">{info.treasuryTon}</span>
         ) : (
-          <b>not configured — set it in the admin panel</b>
+          <b>not switched on yet</b>
         )}
-        <br />
-        <br />
-        <b>Demo build.</b> No real value moves unless a valid TON treasury address is configured and
-        the treasury signs the transfer. {untilLabel(null)}
       </div>
     </section>
   );

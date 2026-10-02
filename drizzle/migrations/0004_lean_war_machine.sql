@@ -1,0 +1,1 @@
+ALTER TABLE "player_profiles" ADD COLUMN "coin_carry_micro" integer DEFAULT 0 NOT NULL;

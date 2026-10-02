@@ -2,8 +2,9 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { trpc } from "../_core/trpc";
 import { useGame } from "../lib/store";
 import { useAudio } from "../lib/audio";
-import { fmtInt, fmtShort, untilLabel } from "../lib/format";
+import { fmtCoin, fmtInt, fmtShort, untilLabel } from "../lib/format";
 import { skinImage, buttonImage } from "../lib/assets";
+import { effectLines } from "../../../shared/item-effects";
 
 interface Fx {
   id: number;
@@ -93,7 +94,9 @@ export default function Mine({ active }: { active: boolean }) {
   if (!state) return null;
   const { cfg, profile, league, boosters, rigs, streakRewards, turboActive, rigPerHour } = state;
 
-  const energyPct = Math.min(100, Math.round((energy / Math.max(1, cfg.energyCap)) * 100));
+  const cap = profile.energyCap;
+  const energyPct = Math.min(100, Math.round((energy / Math.max(1, cap)) * 100));
+  const regenSecs = profile.energyRegenSeconds;
 
   async function runBooster(kind: "turbo" | "energy" | "recharge") {
     setPendingKind(kind);
@@ -177,7 +180,7 @@ export default function Mine({ active }: { active: boolean }) {
           className="tap-btn"
           onPointerDown={onPointerDown}
           onKeyDown={onKeyDown}
-          aria-label={`Mine coin — ${perTap} per tap`}
+          aria-label={`Mine coin — ${fmtCoin(profile.tapPowerPerTapExact)} per tap`}
           disabled={energy <= 0}
         >
           <img className="bg" src={buttonImage(profile.equippedButton)} alt="" draggable={false} />
@@ -207,7 +210,7 @@ export default function Mine({ active }: { active: boolean }) {
         <div className="energy-head">
           <span>⚡ ENERGY</span>
           <span className="v">
-            {fmtInt(Math.floor(energy))} <span>/ {fmtInt(cfg.energyCap)}</span>
+            {fmtInt(Math.floor(energy))} <span>/ {fmtInt(cap)}</span>
           </span>
         </div>
         <div className="bar">
@@ -215,8 +218,8 @@ export default function Mine({ active }: { active: boolean }) {
         </div>
         <div className="charge-note">
           {energy > 0
-            ? `${perTap} COIN per tap · recharges 1 energy every ${cfg.energyRegenSeconds}s`
-            : `Out of energy — it refills 1 point every ${cfg.energyRegenSeconds}s, or use a booster.`}
+            ? `${fmtCoin(profile.tapPowerPerTapExact)} COIN per tap · recharges 1 energy every ${regenSecs}s`
+            : `Out of energy — it refills 1 point every ${regenSecs}s, or use a booster.`}
         </div>
       </div>
 
@@ -268,6 +271,27 @@ export default function Mine({ active }: { active: boolean }) {
           </span>
         </button>
       </div>
+
+      {/* What the equipped assets are actually doing right now. */}
+      {(() => {
+        const lines = effectLines(profile.itemEffects);
+        if (lines.length === 0) return null;
+        return (
+          <div className="card tight" style={{ marginTop: 10 }}>
+            <div className="list-row" style={{ borderBottom: "none" }}>
+              <div className="em">✨</div>
+              <div className="mid">
+                <div className="t">
+                  Active bonuses · {fmtCoin(profile.tapPowerPerTapExact)} COIN/tap
+                </div>
+                <div className="s">
+                  {lines.map((l) => `${l.icon} ${l.label}`).join("  ·  ")}
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       <div className="sec-title">
         <h2>
@@ -385,9 +409,7 @@ export default function Mine({ active }: { active: boolean }) {
       </div>
 
       <div className="foot-note">
-        <b>Demo build.</b> Crypto amounts are illustrative and settled on an
-        off-chain ledger. Real TON payouts require a TON-format treasury address,
-        configured in the admin panel.{" "}
+        Tap power rises with your league, your upgrades and the skin you have equipped.{" "}
         <button
           className="btn btn-ghost xs"
           style={{ display: "inline-flex", marginTop: 8 }}
